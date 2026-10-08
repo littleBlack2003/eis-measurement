@@ -1,0 +1,45 @@
+# Python environments and caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.exe-build-venv/
+.pytest_cache/
+
+# Build artifacts: distribute Windows ZIP packages via GitHub Releases
+build/
+dist/
+*.log
+
+# Local measurements, calibration results, and experiment reports
+data/
+output/
+tmp/
+/偏压扫描*/
+/试验方案/
+cal/*.json
+cal/*.npz
+cal/*.csv
+
+# Local credentials and editor settings
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.workbuddy/
+.vscode/
+.idea/
+
+# Temporary instrument probe
+/probe_tmp.py
+
+# LaTeX auxiliary files
+*.aux
+*.out
+*.toc
+*.synctex.gz
+
+# Operating system files
+Thumbs.db
+.DS_Store

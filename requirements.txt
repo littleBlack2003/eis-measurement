@@ -1,0 +1,9 @@
+numpy
+scipy
+pandas
+PyYAML
+matplotlib
+PyVISA
+pyvisa-py
+pyserial
+dearpygui

@@ -1,0 +1,63 @@
+# =============================================================
+#  阻抗谱 (EIS) 自动化测量系统配置
+#  测量链: 镀金探针 → PCB继电器板 → HP 4284A 阻抗分析仪 (2线法, 每通道校准)
+#  单位: SI, 交流幅值 Vrms
+# =============================================================
+
+instrument:
+  type: hp4284a            # hp4284a | simulator
+  address: GPIB0::17::INSTR
+  timeout: 30              # 秒
+  # 4284A 测量模式: ztd (Z-θ) | cpg (Cp-Gp)
+  function: ztd
+
+relay_board:
+  enabled: false           # true=真实继电器板, false=跳过通道切换(单器件直连)
+  port: COM3               # USB 串口
+  baudrate: 115200
+  # 自定义 ASCII 协议命令模板, {ch} 为通道号占位
+  # 例如 "CH{ch} ON\r"  /  "REL,{ch:02d},1\r" /  "SW{ch}\n"
+  cmd_on: "CH{ch} ON\r"
+  cmd_off: "CH{ch} OFF\r"
+  cmd_all_off: "ALLOFF\r"
+  settle_time: 0.2         # 继电器切换后稳定时间 (秒)
+  n_channels: 8
+
+measurement:
+  # EIS 扫描通道: 若 relay_board.enabled=false 则只测 [0]
+  channels: [0]
+
+  # GUI 自动偏压序列；也可写成逗号列表，如 "-0.5,0,0.5"
+  bias_sequence: "0:1:0.1"
+  bias_settle_s: 0.5       # 切换直流偏压后、开始扫频前的稳定时间 (秒)
+
+  eis:
+    v_dc: 0.0              # V, 直流偏压
+    v_ac: 0.03             # Vrms, 交流幅值 (30 mV)
+    freq_start: 20         # Hz
+    freq_stop: 1.0e6       # Hz (4284A 上限 1 MHz)
+    points_per_decade: 20
+    averaging: 3
+    settle_time: 0.08      # 每频点稳定时间 (秒)
+
+  calibration:
+    enabled: true
+    # 开路/短路校准使用的频率点 (自动取与 EIS 扫描相同的频率轴)
+    averaging: 5
+    settle_time: 0.1
+
+output:
+  directory: "./data"
+  save_raw: true
+  save_plots: true
+  format: csv
+
+# ---- 仿真器物理参数 (仅 instrument.type == simulator 时使用) ----
+simulator:
+  # 每个通道模拟一个不同的 RC 网络, 用于验证校准与多通道切换逻辑
+  channels:
+    0: {series_resistance: 25.0,  shunt_resistance: 1.0e7, capacitance: 2.0e-9}
+    1: {series_resistance: 40.0,  shunt_resistance: 5.0e6,  capacitance: 5.0e-9}
+    2: {series_resistance: 15.0,  shunt_resistance: 2.0e7,  capacitance: 1.0e-9}
+    3: {series_resistance: 60.0,  shunt_resistance: 1.0e6,  capacitance: 8.0e-9}
+  noise_level: 0.005       # Z 的分数高斯噪声
