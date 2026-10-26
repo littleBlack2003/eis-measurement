@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -20,6 +21,7 @@ import yaml
 
 from eis_main import create_instrument, create_relay, run_calibration, run_eis
 from cal.calibration import CalibrationStore
+from measurements.eis import build_freq_axis
 from analysis.auto_fit import fit_csv, find_latest_csv
 
 
@@ -123,6 +125,63 @@ def parse_float(value, name, minimum=None, maximum=None, allow_zero=True):
     return result
 
 
+# 校准方式：界面文字 <-> 配置值。旧配置只有 calibration.enabled，没有 mode。
+CAL_MODES = {
+    'new': '每次扫描前新建校准',
+    'reuse': '使用上次保存的校准',
+    'none': '不校准（原始数据）',
+}
+CAL_FILE = 'calibration.json'
+
+
+def cal_mode_from_config(calibration):
+    mode = calibration.get('mode')
+    if mode in CAL_MODES:
+        return mode
+    return 'new' if calibration.get('enabled', True) else 'none'
+
+
+def check_calibration(store, config):
+    """确认校准文件覆盖全部通道，且频率轴与当前扫描设置一致。
+
+    频率轴不一致时 np.interp 不会报错，只会拿边界值外推——修正结果错了也看不出来，
+    所以必须在开始测量前拦下。
+    """
+    eis = config['measurement']['eis']
+    freqs = build_freq_axis(eis['freq_start'], eis['freq_stop'], eis['points_per_decade'])
+    for ch in config['measurement']['channels']:
+        try:
+            cal = store.get(ch)
+        except KeyError:
+            raise ValueError(f'校准文件里没有通道 {ch}，请重新校准。')
+        if not cal.calibrated:
+            raise ValueError(f'通道 {ch} 的校准不完整，请重新校准。')
+        if len(cal.freqs) != len(freqs) or not np.allclose(cal.freqs, freqs, rtol=1e-6):
+            raise ValueError(
+                f'通道 {ch} 的校准频率轴（{len(cal.freqs)} 点，'
+                f'{cal.freqs[0]:.4g}–{cal.freqs[-1]:.4g} Hz）与当前设置'
+                f'（{len(freqs)} 点，{freqs[0]:.4g}–{freqs[-1]:.4g} Hz）不一致，请重新校准。')
+
+
+def format_duration(seconds):
+    seconds = int(max(0, seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f'{h}:{m:02d}:{s:02d}' if h else f'{m:02d}:{s:02d}'
+
+
+def new_run_dir(output_dir, prefix):
+    """每次测量单独建一个带时间戳的目录，避免新扫描覆盖上一次的 eis_ch*.csv。"""
+    stem = prefix + datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_dir = output_dir / stem
+    suffix = 2
+    while run_dir.exists():
+        run_dir = output_dir / f'{stem}_{suffix}'
+        suffix += 1
+    run_dir.mkdir(parents=True)
+    return run_dir
+
+
 def bias_folder_name(bias):
     value = Decimal(str(bias)).normalize()
     text = format(value, 'f')
@@ -144,6 +203,8 @@ class EISGui:
         self.fit_series = []
         self.fit_results = []
         self._last_axis_update = 0.0
+        self.run_total = 0                # 本次测量的总点数（全部偏压 × 通道 × 频点）
+        self.run_started = 0.0
         try:
             with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
                 self.config = yaml.safe_load(f) or {}
@@ -357,7 +418,8 @@ class EISGui:
                                                tag='port', width=100)
                             channels = ','.join(map(str, measurement.get('channels', [0])))
                             dpg.add_input_text(label='测量通道', default_value=channels,
-                                               tag='channels', width=240)
+                                               tag='channels', width=240,
+                                               callback=self._on_param_change)
                         dpg.add_checkbox(label='启用继电器板', default_value=bool(
                             relay.get('enabled', False)), tag='relay_enabled')
                         with dpg.group(horizontal=True):
@@ -368,12 +430,15 @@ class EISGui:
                         self._hint('通道可填多个，用逗号分隔（例如 0,1,2）。GPIB 需要本机安装 '
                                    'NI-VISA 或 Keysight IO Libraries；串口／TCP 才可用内置的 '
                                    'pyvisa-py 后端。', width=self.LEFT_CONTENT)
-                    with dpg.collapsing_header(label='测量参数', default_open=False):
+                    # 测量参数默认展开：折叠起来就看不到本次到底按什么条件测
+                    with dpg.collapsing_header(label='测量参数', default_open=True):
                         with dpg.group(horizontal=True):
                             dpg.add_input_text(label='起始频率 Hz', default_value=str(
-                                eis.get('freq_start', 20)), tag='freq_start', width=110)
+                                eis.get('freq_start', 20)), tag='freq_start', width=110,
+                                callback=self._on_param_change)
                             dpg.add_input_text(label='终止频率 Hz', default_value=str(
-                                eis.get('freq_stop', 1.0e6)), tag='freq_stop', width=110)
+                                eis.get('freq_stop', 1.0e6)), tag='freq_stop', width=110,
+                                callback=self._on_param_change)
                         with dpg.group(horizontal=True):
                             dpg.add_input_text(label='直流偏压 V', default_value=str(
                                 eis.get('v_dc', 0.0)), tag='v_dc', width=100)
@@ -381,22 +446,31 @@ class EISGui:
                                 eis.get('v_ac', 0.03)), tag='v_ac', width=100)
                         with dpg.group(horizontal=True):
                             dpg.add_input_text(label='每十倍频点数', default_value=str(
-                                eis.get('points_per_decade', 20)), tag='points', width=90)
+                                eis.get('points_per_decade', 20)), tag='points', width=90,
+                                callback=self._on_param_change)
                             dpg.add_input_text(label='平均次数', default_value=str(
                                 eis.get('averaging', 3)), tag='averaging', width=90)
                         dpg.add_input_text(label='频点稳定时间 s', default_value=str(
                             eis.get('settle_time', 0.08)), tag='settle_time', width=90)
-                        dpg.add_checkbox(label='扫描前执行开路/短路校准', default_value=bool(
-                            calibration.get('enabled', True)), tag='calibrate')
-                        dpg.add_checkbox(label='校准后确认再测量', default_value=bool(
+                        self._hint('HP 4284A 频率范围 20 Hz – 1 MHz，交流幅值 5 mV – 2 Vrms；'
+                                   '小信号测量一般取 10–50 mVrms。', width=self.LEFT_CONTENT)
+                    with dpg.collapsing_header(label='开路/短路校准', default_open=True):
+                        dpg.add_combo(list(CAL_MODES.values()), label='校准方式',
+                                      default_value=CAL_MODES[cal_mode_from_config(calibration)],
+                                      tag='cal_mode', width=230,
+                                      callback=self._on_param_change)
+                        dpg.add_checkbox(label='新建校准后确认再测量', default_value=bool(
                             calibration.get('confirm_after', False)), tag='cal_confirm')
-                        self._hint('HP 4284A 频率范围 20 Hz – 1 MHz；交流幅值按小信号条件取 '
-                                   '10–50 mVrms。总点数 = 每十倍频点数 × 十倍频数 × 通道数。',
+                        dpg.add_text('', tag='cal_info', wrap=self.LEFT_CONTENT)
+                        self._hint('校准时直流偏压固定为 0 V。新建的校准会存到输出目录的 '
+                                   'calibration.json，供“使用上次保存的校准”复用；'
+                                   '频率轴或通道与当前设置不符时会拒绝开始。',
                                    width=self.LEFT_CONTENT)
                     with dpg.collapsing_header(label='偏压序列扫描', default_open=False):
                         dpg.add_input_text(label='偏压序列 V', default_value=str(
                             measurement.get('bias_sequence', '0:1:0.1')),
-                            tag='bias_sequence', width=300)
+                            tag='bias_sequence', width=300,
+                            callback=self._on_param_change)
                         dpg.add_input_text(label='每个偏压稳定时间 s', default_value=str(
                             measurement.get('bias_settle_s', 0.5)), tag='bias_settle',
                             width=110)
@@ -405,13 +479,20 @@ class EISGui:
                                    width=self.LEFT_CONTENT)
                     dpg.add_separator()
                     dpg.add_input_text(label='输出目录', default_value=str(
-                        output.get('directory', './data')), tag='output_dir', width=330)
+                        output.get('directory', './data')), tag='output_dir', width=330,
+                        callback=self._on_param_change)
                     with dpg.group(horizontal=True):
-                        dpg.add_button(label='使用默认目录', callback=self._default_output,
-                                       width=130, height=30)
+                        dpg.add_button(label='浏览…', tag='browse_button',
+                                       callback=lambda: dpg.show_item('dir_dialog'),
+                                       width=90, height=30)
+                        dpg.add_button(label='使用默认目录', tag='default_dir_button',
+                                       callback=self._default_output, width=130, height=30)
                         dpg.add_button(label='打开目录', callback=self._open_output_dir,
                                        width=120, height=30)
+                    self._hint('每次测量都会在输出目录下新建 scan_时间 或 bias_sequence_时间 '
+                               '子目录，不会覆盖以前的数据。', width=self.LEFT_CONTENT)
                     dpg.add_separator()
+                    dpg.add_text('', tag='run_summary', wrap=self.LEFT_CONTENT)
                     with dpg.group(horizontal=True):
                         dpg.add_button(label='开始完整扫描', tag='start_button',
                                        callback=self._start, user_data='single',
@@ -423,8 +504,8 @@ class EISGui:
                         dpg.add_button(label='停止扫描', tag='stop_button',
                                        callback=self._cancel_scan, enabled=False,
                                        width=140, height=38)
-                        dpg.add_button(label='保存配置', callback=self._save_config,
-                                       width=140, height=38)
+                        dpg.add_button(label='保存配置', tag='save_config_button',
+                                       callback=self._save_config, width=140, height=38)
                     # 连接测试放在始终可见的位置：参数区默认是折叠的，藏进去会找不到
                     with dpg.group(horizontal=True):
                         dpg.add_button(label='测试连接', tag='connect_button',
@@ -437,6 +518,7 @@ class EISGui:
                         dpg.add_progress_bar(tag='progress', default_value=0.0,
                                              width=self.LEFT_CONTENT - 50, height=18,
                                              overlay='0 / 0 点')
+                    dpg.add_text('', tag='progress_time', color=self.HINT)
                     with dpg.group(horizontal=True):
                         dpg.add_text('状态', color=self.ACCENT)
                         dpg.add_text('就绪', tag='status', color=self.OK_GREEN)
@@ -479,7 +561,8 @@ class EISGui:
                     with dpg.collapsing_header(label='数据处理（等效电路拟合）',
                                                default_open=True):
                         with dpg.group(horizontal=True):
-                            dpg.add_button(label='拟合最新数据', callback=self._fit_latest_clicked,
+                            dpg.add_button(label='拟合最新数据', tag='fit_latest_button',
+                                           callback=self._fit_latest_clicked,
                                            width=140, height=30)
                             dpg.add_checkbox(label='扫描完成后自动拟合', default_value=bool(
                                 (measurement.get('fitting') or {}).get('auto_fit', True)),
@@ -530,7 +613,8 @@ class EISGui:
                                        width=self.CONTENT_WIDTH, height=170, default_value='')
 
         with dpg.window(label='开路/短路校准', tag='calibration_dialog', modal=True,
-                        show=False, no_title_bar=True, width=470, height=180):
+                        show=False, no_title_bar=True, width=470, height=200):
+            dpg.add_text('', tag='calibration_step', color=self.ACCENT)
             dpg.add_text('', tag='calibration_prompt', wrap=440)
             dpg.add_spacer(height=15)
             with dpg.group(horizontal=True):
@@ -546,6 +630,12 @@ class EISGui:
             dpg.add_spacer(height=10)
             dpg.add_button(label='确定', callback=lambda: dpg.configure_item(
                 'message_dialog', show=False), width=100)
+
+        dpg.add_file_dialog(tag='dir_dialog', directory_selector=True, show=False,
+                            modal=True, width=720, height=420,
+                            default_path=self._resolved_output_dir_from(
+                                output.get('directory', './data')),
+                            callback=self._on_dir_selected)
 
         font_dir = Path(os.environ.get('WINDIR', r'C:\Windows')) / 'Fonts'
         for font_name in ('msyh.ttc', 'Deng.ttf', 'simhei.ttf', 'simsun.ttc'):
@@ -566,6 +656,86 @@ class EISGui:
         self._set_window_icon()
         # 启动后先按实际视口（含 DPI 缩放后的真实尺寸）校正一次
         self._apply_responsive_layout()
+        self._on_param_change()
+
+    # 扫描期间锁定的控件：改了也不会作用到正在进行的测量，留着可编辑只会误导
+    LOCKED_WHILE_RUNNING = (
+        'mode', 'timeout', 'address', 'port', 'channels', 'relay_enabled',
+        'list_resources_button', 'connect_button',
+        'freq_start', 'freq_stop', 'v_dc', 'v_ac', 'points', 'averaging', 'settle_time',
+        'cal_mode', 'cal_confirm', 'bias_sequence', 'bias_settle',
+        'output_dir', 'browse_button', 'default_dir_button', 'save_config_button',
+        'fit_latest_button',
+    )
+
+    def _set_running(self, running):
+        dpg.configure_item('start_button', enabled=not running)
+        dpg.configure_item('bias_start_button', enabled=not running)
+        dpg.configure_item('stop_button', enabled=running)
+        for tag in self.LOCKED_WHILE_RUNNING:
+            if dpg.does_item_exist(tag):
+                dpg.configure_item(tag, enabled=not running)
+        dpg.configure_viewport(0, disable_close=running)
+
+    def _on_param_change(self, sender=None, app_data=None, user_data=None):
+        self._update_run_summary()
+        self._update_cal_info()
+
+    def _update_run_summary(self):
+        """开始前就告诉用户这次要测多少点，免得设错点数后跑了几个小时才发现。"""
+        try:
+            f1 = parse_float(dpg.get_value('freq_start'), '起始频率 Hz', minimum=20, maximum=1e6)
+            f2 = parse_float(dpg.get_value('freq_stop'), '终止频率 Hz', minimum=20, maximum=1e6)
+            if f2 <= f1:
+                raise ValueError('终止频率必须大于起始频率。')
+            ppd = parse_int(dpg.get_value('points'), '每十倍频点数', minimum=1, maximum=100)
+            n_freq = len(build_freq_axis(f1, f2, ppd))
+            n_ch = len([c for c in dpg.get_value('channels').split(',') if c.strip()])
+            if n_ch == 0:
+                raise ValueError('至少填写一个测量通道。')
+        except ValueError as exc:
+            dpg.set_value('run_summary', f'参数待修正：{exc}')
+            dpg.configure_item('run_summary', color=self.WARN_AMBER)
+            return
+        text = f'单次扫描：{n_freq} 频点 × {n_ch} 通道 = {n_freq * n_ch} 点'
+        try:
+            n_bias = len(parse_bias_sequence(dpg.get_value('bias_sequence')))
+            text += f'\n偏压序列：{n_bias} 个偏压，共 {n_freq * n_ch * n_bias} 点'
+        except ValueError as exc:
+            text += f'\n偏压序列无效：{exc}'
+        dpg.set_value('run_summary', text)
+        dpg.configure_item('run_summary', color=self.ACCENT)
+
+    def _cal_mode(self):
+        label = dpg.get_value('cal_mode')
+        return next((k for k, v in CAL_MODES.items() if v == label), 'new')
+
+    def _update_cal_info(self):
+        """显示输出目录里已保存的校准，选择“复用”之前就能看到它是哪天、什么频率轴。"""
+        path = Path(self._resolved_output_dir()) / CAL_FILE
+        if not path.exists():
+            text = '已保存的校准：无'
+            color = self.ERR_RED if self._cal_mode() == 'reuse' else self.HINT
+        else:
+            try:
+                store = CalibrationStore.load(str(path))
+                stamp = datetime.fromtimestamp(path.stat().st_mtime).strftime('%Y-%m-%d %H:%M')
+                chans = sorted(store.channels)
+                cal = store.channels[chans[0]]
+                text = (f'已保存的校准：{stamp}，通道 {",".join(map(str, chans))}，'
+                        f'{len(cal.freqs)} 点 {cal.freqs[0]:.4g}–{cal.freqs[-1]:.4g} Hz')
+                color = self.HINT
+            except Exception as exc:
+                text = f'已保存的校准无法读取：{exc}'
+                color = self.ERR_RED
+        dpg.set_value('cal_info', text)
+        dpg.configure_item('cal_info', color=color)
+
+    def _on_dir_selected(self, sender, app_data):
+        path = (app_data or {}).get('file_path_name')
+        if path:
+            dpg.set_value('output_dir', path)
+            self._on_param_change()
 
     def _on_viewport_resize(self, sender=None, app_data=None, user_data=None):
         self._apply_responsive_layout()
@@ -639,6 +809,7 @@ class EISGui:
 
     def _default_output(self, sender=None, app_data=None, user_data=None):
         dpg.set_value('output_dir', './data')
+        self._on_param_change()
 
     def _open_output_dir(self, sender=None, app_data=None, user_data=None):
         """在文件管理器中打开当前输出目录，省去手动复制路径。"""
@@ -778,7 +949,12 @@ class EISGui:
             self.events.put(('res_done', False, str(exc)))
 
     def _settings(self):
-        config = self.config
+        """按界面内容生成一份新配置（不改 self.config，校验到一半失败也不会留下半改的状态）。
+
+        output.directory 保持界面上的写法（通常是相对路径），这样存回 eis_config.yaml
+        后换台电脑或挪动程序目录仍然可用；真正测量时再用 _resolved_output_dir() 解析。
+        """
+        config = copy.deepcopy(self.config)
         config.setdefault('instrument', {})
         config['instrument']['type'] = 'simulator' if dpg.get_value('mode') == '仿真器' else 'hp4284a'
         config['instrument']['address'] = dpg.get_value('address').strip()
@@ -819,21 +995,19 @@ class EISGui:
         eis['points_per_decade'] = parse_int(dpg.get_value('points'), '每十倍频点数',
                                              minimum=1, maximum=100)
         eis['averaging'] = parse_int(dpg.get_value('averaging'), '平均次数',
-                                     minimum=1, maximum=256)
+                                     minimum=1, maximum=128)
         # 该值此前在界面上没有入口，配置里的 eis.settle_time 无法被修改
         eis['settle_time'] = parse_float(dpg.get_value('settle_time'), '频点稳定时间 s',
                                          minimum=0, maximum=60)
-        config['measurement'].setdefault('calibration', {})
-        config['measurement']['calibration']['enabled'] = dpg.get_value('calibrate')
-        config['measurement']['calibration']['confirm_after'] = dpg.get_value('cal_confirm')
+        calibration = config['measurement'].setdefault('calibration', {})
+        calibration['mode'] = self._cal_mode()
+        # enabled 仍保留给命令行 eis_main.py 使用
+        calibration['enabled'] = calibration['mode'] == 'new'
+        calibration['confirm_after'] = dpg.get_value('cal_confirm')
         config['measurement'].setdefault('fitting', {})
         config['measurement']['fitting']['auto_fit'] = dpg.get_value('auto_fit')
         config.setdefault('output', {})
         config['output']['directory'] = dpg.get_value('output_dir').strip() or './data'
-        output_path = Path(config['output']['directory']).expanduser()
-        if not output_path.is_absolute():
-            output_path = CONFIG_PATH.parent / output_path
-        config['output']['directory'] = str(output_path.resolve())
         return config
 
     def _write_config(self, config):
@@ -844,6 +1018,7 @@ class EISGui:
         try:
             config = self._settings()
             self._write_config(config)
+            self.config = config
             self._show_message('配置已保存', f'设置已保存到：\n{CONFIG_PATH}')
         except Exception as exc:
             self._show_message('设置无效', str(exc))
@@ -851,24 +1026,46 @@ class EISGui:
     def _start(self, sender=None, app_data=None, user_data=None):
         if self.worker and self.worker.is_alive():
             return
+        if self._busy_with_connection():
+            self._show_message('仪器占用中', '正在测试连接或枚举资源，请稍候再开始测量。')
+            return
         try:
-            config = self._settings()
-            biases = parse_bias_sequence(config['measurement']['bias_sequence']) \
+            saved = self._settings()
+            biases = parse_bias_sequence(saved['measurement']['bias_sequence']) \
                 if user_data == 'bias' else None
-            self._write_config(config)
+            config = copy.deepcopy(saved)
+            config['output']['directory'] = self._resolved_output_dir()
+            # “复用校准”在开始前就检查：等仪器连上、跑到一半才报错太晚了
+            calibration_store = None
+            if self._cal_mode() == 'reuse':
+                cal_path = Path(config['output']['directory']) / CAL_FILE
+                if not cal_path.exists():
+                    raise ValueError(f'输出目录里没有已保存的校准：\n{cal_path}\n\n'
+                                     '请把校准方式改为“每次扫描前新建校准”。')
+                calibration_store = CalibrationStore.load(str(cal_path))
+                check_calibration(calibration_store, config)
+            self._write_config(saved)
+            self.config = saved
         except Exception as exc:
             self._show_message('设置无效', str(exc))
             return
-        dpg.configure_item('start_button', enabled=False)
-        dpg.configure_item('bias_start_button', enabled=False)
-        dpg.configure_item('stop_button', enabled=True)
-        dpg.configure_viewport(0, disable_close=True)
+        eis = config['measurement']['eis']
+        n_freq = len(build_freq_axis(eis['freq_start'], eis['freq_stop'],
+                                     eis['points_per_decade']))
+        self.run_total = n_freq * len(config['measurement']['channels']) * \
+            (len(biases) if biases is not None else 1)
+        self._points_done = 0
         self.cancel_event.clear()
+        self._set_running(True)
         dpg.set_value('status', '偏压序列运行中…' if biases is not None else '测量运行中…')
+        dpg.configure_item('status', color=self.ACCENT)
         self._reset_live_curves()
-        self._append_log('开始测量。')
+        dpg.configure_item('progress', overlay=f'0 / {self.run_total} 点')
+        self.run_started = time.monotonic()
+        self._append_log(f'开始测量：共 {self.run_total} 点，'
+                         f'校准方式：{CAL_MODES[self._cal_mode()]}。')
         self.worker = threading.Thread(target=self._run_worker,
-                                       args=(config, biases), daemon=True)
+                                       args=(config, biases, calibration_store), daemon=True)
         self.worker.start()
 
     def _cancel_scan(self, sender=None, app_data=None, user_data=None):
@@ -880,10 +1077,10 @@ class EISGui:
         if self.cancel_event.is_set():
             raise ScanCancelled('扫描已停止。')
 
-    def _request_calibration_prompt(self, text):
+    def _request_calibration_prompt(self, text, step_label=''):
         response = threading.Event()
         result = {}
-        self.events.put(('prompt', text, response, result))
+        self.events.put(('prompt', text, response, result, step_label))
         # 原先是无限期 wait(): 若界面事件循环卡住或用户已点停止, 工作线程会
         # 永久阻塞导致"停止扫描"失效。改成轮询等待, 期间可响应取消请求。
         while not response.wait(timeout=0.2):
@@ -896,9 +1093,11 @@ class EISGui:
 
     def _point_observer(self, channel, frequency, z, index, total, bias=None):
         self._check_cancelled()
+        # 只有工作线程会调用这里，计数不需要加锁
+        self._points_done += 1
         self.events.put(('point', bias, channel, frequency, z.real, z.imag,
                          abs(z), math.degrees(cmath.phase(z)),
-                         index, total))
+                         index, total, self._points_done))
 
     def _run_bias_sequence(self, instrument, relay, config, biases,
                            calibration_store, run_dir):
@@ -906,8 +1105,6 @@ class EISGui:
         channels = ','.join(map(str, config['measurement']['channels']))
         manifest = run_dir / 'bias_sequence.csv'
         rows = []
-        with open(run_dir / 'eis_config.yaml', 'w', encoding='utf-8') as f:
-            yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
         for index, bias in enumerate(biases, start=1):
             self._check_cancelled()
             self.events.put(('bias_start', bias, index, len(biases)))
@@ -917,8 +1114,9 @@ class EISGui:
                 instrument.set_dc_bias(bias)
             elif abs(bias) <= 1e-6 and hasattr(instrument, 'disable_dc_bias'):
                 instrument.disable_dc_bias()
-            if settle_s:
-                time.sleep(settle_s)
+            # 用可中断的等待代替 sleep：稳定时间设得长时，“停止扫描”也要立刻生效
+            if settle_s and self.cancel_event.wait(settle_s):
+                raise ScanCancelled('扫描已停止。')
             self._check_cancelled()
             bias_config = copy.deepcopy(config)
             bias_config['measurement']['eis']['v_dc'] = bias
@@ -934,57 +1132,75 @@ class EISGui:
                 writer.writerow(('bias_V', 'folder', 'channels'))
                 writer.writerows(rows)
 
-    def _run_worker(self, config, biases):
+    def _run_worker(self, config, biases, calibration_store=None):
+        log = logging.getLogger(__name__)
         instrument = None
         relay = None
-        success = False
+        run_dir = None
+        # 结局用显式代码区分，不再从提示文字里搜“停止”“取消”来猜
+        outcome = 'error'
         details = ''
         try:
             instrument = create_instrument(config)
             relay = create_relay(config)
             output_dir = Path(config['output']['directory'])
             output_dir.mkdir(parents=True, exist_ok=True)
-            run_dir = output_dir
-            if biases is not None:
-                stem = 'bias_sequence_' + datetime.now().strftime('%Y%m%d_%H%M%S')
-                run_dir = output_dir / stem
-                suffix = 2
-                while run_dir.exists():
-                    run_dir = output_dir / f'{stem}_{suffix}'
-                    suffix += 1
-                run_dir.mkdir()
-                logging.getLogger(__name__).info('Bias sweep output: %s', run_dir)
-            calibration_store = None
-            if config['measurement']['calibration']['enabled']:
+            run_dir = new_run_dir(output_dir,
+                                  'bias_sequence_' if biases is not None else 'scan_')
+            log.info('Output: %s', run_dir)
+            # 每次测量都留一份当时的完整配置，事后才能查清数据是按什么条件测的
+            with open(run_dir / 'eis_config.yaml', 'w', encoding='utf-8') as f:
+                yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
+
+            cal_cfg = config['measurement']['calibration']
+            if cal_cfg['mode'] == 'new':
+                # 开路/短路补偿的是夹具与引线的寄生参数，与偏压无关；短路时带着偏压
+                # 只会让偏压源经 100 Ω 输出阻抗直接对地放电，所以统一在 0 V 下校准。
                 cal_config = copy.deepcopy(config)
-                if biases is not None:
-                    cal_config['measurement']['eis']['v_dc'] = 0.0
+                cal_config['measurement']['eis']['v_dc'] = 0.0
+                total_steps = 2 * len(config['measurement']['channels'])
+                step = [0]
+
+                def prompt(text):
+                    step[0] += 1
+                    self._request_calibration_prompt(
+                        text, f'校准步骤 {step[0]} / {total_steps}')
+
                 calibration_store = run_calibration(
                     instrument, relay, cal_config, str(run_dir),
-                    prompt_fn=self._request_calibration_prompt,
-                    check_cancel=self._check_cancelled,
+                    prompt_fn=prompt, check_cancel=self._check_cancelled,
                 )
-                if config['measurement']['calibration'].get('confirm_after'):
+                # 同时作为“上次保存的校准”放到输出目录根下，供下次复用
+                shutil.copy2(run_dir / CAL_FILE, output_dir / CAL_FILE)
+                if cal_cfg.get('confirm_after'):
                     self._request_calibration_prompt(
-                        '校准已完成。请确认样品连接与偏压设置无误，再开始测量。')
-            elif (output_dir / 'calibration.json').exists():
-                calibration_store = CalibrationStore.load(
-                    str(output_dir / 'calibration.json'))
+                        '校准已完成。请装上样品并确认连接无误，再开始测量。', '校准完成')
+            elif calibration_store is not None:
+                # 复用的校准也拷一份进本次目录，数据和它用的校准放在一起
+                calibration_store.save(str(run_dir / CAL_FILE))
+            else:
+                log.warning('未使用开路/短路校准，保存的是原始阻抗。')
+
             if biases is None:
-                run_eis(instrument, relay, config, str(output_dir),
+                scan_config = copy.deepcopy(config)
+                scan_config['output']['directory'] = str(run_dir)
+                run_eis(instrument, relay, scan_config, str(run_dir),
                         calibration_store, on_point=self._point_observer)
+                details = f'扫描完成。\n结果：{run_dir}'
             else:
                 self._run_bias_sequence(instrument, relay, config, biases,
                                         calibration_store, run_dir)
-            success = True
-            details = f'偏压序列扫描完成，共 {len(biases)} 个偏压。\n结果：{run_dir}' \
-                if biases is not None else '扫描完成。'
+                details = f'偏压序列扫描完成，共 {len(biases)} 个偏压。\n结果：{run_dir}'
+            outcome = 'ok'
         except CalibrationCancelled as exc:
-            details = str(exc)
+            outcome, details = 'cal_cancelled', str(exc)
         except ScanCancelled as exc:
-            details = str(exc)
+            outcome = 'cancelled'
+            # run_eis 整段扫完才写 CSV，中途停止的那一段不会保存
+            details = str(exc) + (f'\n已完成的扫描保存在：{run_dir}\n'
+                                  '（被中断的那一段不保存）' if run_dir else '')
         except Exception as exc:
-            logging.getLogger(__name__).exception('测量失败')
+            log.exception('测量失败')
             details = f'{exc}\n\n{traceback.format_exc()}'
         finally:
             if instrument is not None and hasattr(instrument, 'disable_dc_bias'):
@@ -1002,7 +1218,7 @@ class EISGui:
                     instrument.close()
                 except Exception:
                     logging.getLogger(__name__).exception('关闭仪器失败')
-        self.events.put(('finished', success, details))
+        self.events.put(('finished', outcome, details, str(run_dir) if run_dir else None))
 
     def _poll_events(self):
         while True:
@@ -1015,9 +1231,10 @@ class EISGui:
             elif event[0] == 'point':
                 self._record_point(*event[1:])
             elif event[0] == 'prompt':
-                _, text, self.prompt_response, self.prompt_result = event
+                _, text, self.prompt_response, self.prompt_result, step_label = event
+                dpg.set_value('calibration_step', step_label)
                 dpg.set_value('calibration_prompt', text + '\n\n确认后请选择“继续”。')
-                dpg.configure_item('calibration_dialog', show=True)
+                self._show_centered('calibration_dialog')
             elif event[0] == 'close_prompt':
                 # 工作线程因取消而放弃等待, 收掉可能残留的模态弹窗
                 if self.prompt_response is not None:
@@ -1065,18 +1282,22 @@ class EISGui:
             elif event[0] == 'fit_done':
                 self._show_fit_results(event[1])
             elif event[0] == 'finished':
-                _, success, details = event
-                dpg.configure_item('start_button', enabled=True)
-                dpg.configure_item('bias_start_button', enabled=True)
-                dpg.configure_item('stop_button', enabled=False)
-                dpg.configure_viewport(0, disable_close=False)
-                dpg.set_value('status', '扫描完成' if success else (
-                    '扫描已停止' if '停止' in details else
-                    '校准已取消' if '取消' in details else '测量失败'))
-                self._show_message('完成' if success else '扫描已停止' if '停止' in details
-                                   else '测量失败', details)
-                if success and dpg.get_value('auto_fit'):
-                    threading.Thread(target=self._fit_worker, daemon=True).start()
+                _, outcome, details, run_dir = event
+                self._set_running(False)
+                status, title, color = {
+                    'ok': ('扫描完成', '完成', self.OK_GREEN),
+                    'cancelled': ('扫描已停止', '扫描已停止', self.WARN_AMBER),
+                    'cal_cancelled': ('校准已取消', '校准已取消', self.WARN_AMBER),
+                }.get(outcome, ('测量失败', '测量失败', self.ERR_RED))
+                dpg.set_value('status', status)
+                dpg.configure_item('status', color=color)
+                dpg.set_value('progress_time',
+                              f'用时 {format_duration(time.monotonic() - self.run_started)}')
+                self._update_cal_info()
+                self._show_message(title, details)
+                if outcome == 'ok' and dpg.get_value('auto_fit'):
+                    threading.Thread(target=self._fit_worker, args=(run_dir,),
+                                     daemon=True).start()
 
     def _delete_series(self, tag):
         """删除曲线时一并回收它的着色主题，避免长时间扫描累积泄漏。"""
@@ -1095,12 +1316,24 @@ class EISGui:
         self._last_axis_update = 0.0
         dpg.set_value('progress', 0.0)
         dpg.configure_item('progress', overlay='0 / 0 点')
+        dpg.set_value('progress_time', '')
         for axis in ('nyquist_x', 'nyquist_y', 'magnitude_x', 'magnitude_y',
                      'phase_x', 'phase_y'):
             dpg.set_axis_limits_auto(axis)
 
     def _record_point(self, bias, channel, frequency, z_real, z_imag, magnitude,
-                      phase_deg, index, total):
+                      phase_deg, index, total, done=None):
+        self._plot_point(bias, channel, frequency, z_real, z_imag, magnitude, phase_deg)
+        prefix = f'{bias:+g} V · ' if bias is not None else ''
+        flag = '（无效点）' if not (math.isfinite(z_real) and math.isfinite(z_imag)) else ''
+        dpg.set_value('status',
+                      f'{prefix}CH {channel}: {index}/{total} 点，{frequency:.1f} Hz{flag}')
+        self._update_progress(index, total, done)
+
+    def _plot_point(self, bias, channel, frequency, z_real, z_imag, magnitude, phase_deg):
+        # 仪器状态 -1/1/2 的点是 NaN：不画进曲线（否则会打断折线、搅乱自动坐标），只计进度
+        if not (math.isfinite(z_real) and math.isfinite(z_imag)):
+            return
         key = (bias, channel)
         data = self.live_data.setdefault(key, {
             'freq': [], 'z_real': [], 'neg_z_imag': [], 'magnitude': [], 'phase': [],
@@ -1128,11 +1361,23 @@ class EISGui:
             dpg.set_value(tags['nyquist'], [data['z_real'], data['neg_z_imag']])
             dpg.set_value(tags['magnitude'], [data['freq'], data['magnitude']])
             dpg.set_value(tags['phase'], [data['freq'], data['phase']])
-        prefix = f'{bias:+g} V · ' if bias is not None else ''
-        dpg.set_value('status', f'{prefix}CH {channel}: {index}/{total} 点，{frequency:.1f} Hz')
-        # 进度条 (偏压序列时叠加显示第几个偏压的进度)
-        dpg.set_value('progress', index / total if total else 0.0)
-        dpg.configure_item('progress', overlay=f'{index} / {total} 点')
+
+    def _update_progress(self, index, total, done):
+        # 进度条按整次测量（全部偏压 × 通道）计算；以前只显示当前这一条曲线，
+        # 偏压序列里每个偏压都从 0 重来，看不出整体还要多久
+        if done is not None and self.run_total:
+            dpg.set_value('progress', min(1.0, done / self.run_total))
+            dpg.configure_item('progress', overlay=f'{done} / {self.run_total} 点')
+            elapsed = time.monotonic() - self.run_started
+            text = f'已用 {format_duration(elapsed)}'
+            if done >= 3 and done < self.run_total:
+                # 扫频从低频往高频走，低频点慢，所以前段的估计偏保守
+                remaining = elapsed / done * (self.run_total - done)
+                text += f' · 预计剩余约 {format_duration(remaining)}'
+            dpg.set_value('progress_time', text)
+        else:
+            dpg.set_value('progress', index / total if total else 0.0)
+            dpg.configure_item('progress', overlay=f'{index} / {total} 点')
         # 坐标轴自适应开销较大: 原先每个频点都对 6 个轴重算一次 (94 点约 564 次),
         # 扫描过程中会明显掉帧。改为按时间节流, 最多每 0.25 s 更新一次。
         now = time.monotonic()
@@ -1172,17 +1417,23 @@ class EISGui:
         threading.Thread(target=self._fit_worker, daemon=True).start()
 
     def _resolved_output_dir(self):
-        out = dpg.get_value('output_dir').strip() or './data'
-        path = Path(out).expanduser()
+        return self._resolved_output_dir_from(dpg.get_value('output_dir'))
+
+    @staticmethod
+    def _resolved_output_dir_from(text):
+        """相对路径以配置文件所在目录为基准（双击 exe 时结果也写在程序目录）。"""
+        path = Path(str(text).strip() or './data').expanduser()
         if not path.is_absolute():
             path = CONFIG_PATH.parent / path
         return str(path.resolve())
 
-    def _fit_worker(self):
+    def _fit_worker(self, target_dir=None):
+        """拟合 target_dir（刚完成的那次测量）；手动点按钮时取输出目录里最新的一次。"""
         try:
-            csvs = find_latest_csv(self._resolved_output_dir())
+            csvs = find_latest_csv(target_dir or self._resolved_output_dir())
             results = []
-            for path in csvs[:20]:
+            # 以前只取前 20 个文件：-1:1:0.1 这种 21 个偏压的序列会静默漏掉最后一个
+            for path in csvs:
                 try:
                     results.append(fit_csv(path))
                 except Exception as exc:
@@ -1325,7 +1576,19 @@ class EISGui:
     def _show_message(self, title, message):
         dpg.set_value('message_title', title)
         dpg.set_value('message_text', message)
-        dpg.configure_item('message_dialog', show=True)
+        self._show_centered('message_dialog')
+
+    def _show_centered(self, tag):
+        """弹窗默认出现在左上角，容易被当成界面的一部分而忽略，统一居中显示。"""
+        try:
+            cfg = dpg.get_item_configuration(tag)
+            vw = dpg.get_viewport_client_width()
+            vh = dpg.get_viewport_client_height()
+            dpg.set_item_pos(tag, [max(0, (vw - cfg['width']) // 2),
+                                   max(0, (vh - cfg['height']) // 3)])
+        except Exception:
+            pass
+        dpg.configure_item(tag, show=True)
 
     def _append_log(self, message):
         current = dpg.get_value('log_text')

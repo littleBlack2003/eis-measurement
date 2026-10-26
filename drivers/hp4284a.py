@@ -18,6 +18,19 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# FETCH? 第三个字段的含义 (操作手册 7-8, Data Transfer / ASCII Format)
+FETCH_STATUS = {
+    -1: '数据缓冲区无数据',
+    0: '正常',
+    1: '模拟电桥失衡',
+    2: 'A/D 转换器不工作',
+    3: '信号源过载',
+    4: 'ALC 无法稳压',
+}
+# 这几种状态下仪器返回的是占位值 9.9E37 而不是读数 (手册 7-8 Note);
+# 3、4 仍是实际测量值, 只是不保证准确, 保留数值并靠 status 列标记
+INVALID_STATUS = (-1, 1, 2)
+
 
 class HP4284A:
     """HP/Agilent 4284A LCR Meter via GPIB/USB/LAN (Z-θ 模式)."""
@@ -35,6 +48,8 @@ class HP4284A:
         self.reset()
         idn = self.query("*IDN?")
         logger.info(f"Connected to: {idn.strip()}")
+        # 最近一次 measure_complex_z 的 FETCH? 状态码, 调用方据此标记坏点
+        self.last_status = 0
 
         self.function = function.lower()
         if self.function == 'ztd':
@@ -45,6 +60,10 @@ class HP4284A:
         else:
             raise ValueError(f"Unknown function: {function}")
         self.write("APER MED,2")
+        # *RST 后触发源是 INT (内部连续触发, 附录 C-2): 仪器一直在自己测,
+        # FETCH? 可能拿到改频率/偏压之前那一次的结果。改为 BUS, 只在
+        # TRIG:IMM 时测一次, 与手册的程控示例 (7-14 Figure 7-11) 一致。
+        self.write("TRIG:SOUR BUS")
 
     def reset(self):
         self.write("*RST")
@@ -81,8 +100,9 @@ class HP4284A:
         self.write("BIAS:STAT OFF")
 
     def set_averaging(self, n: int):
-        if not (1 <= n <= 256):
-            raise ValueError(f"Averaging {n} out of range [1, 256]")
+        # 操作手册 8-39 写 1~128; 数据手册写 1~256 (可能是后期固件), 取保守值
+        if not (1 <= n <= 128):
+            raise ValueError(f"Averaging {n} out of range [1, 128]")
         self.write(f"APER MED,{n}")
 
     def trigger_and_fetch(self) -> Tuple[float, float, int]:
@@ -125,7 +145,8 @@ class HP4284A:
         Returns
         -------
         complex
-            复数阻抗 (Ω)
+            复数阻抗 (Ω)。状态码为 -1/1/2 时返回 nan+nanj;
+            状态码本身存在 self.last_status。
         """
         if self.function != 'ztd':
             self.write("FUNC:IMP ZTD")
@@ -140,8 +161,13 @@ class HP4284A:
 
         time.sleep(settle_time)
         z_mag, theta_deg, status = self.trigger_and_fetch()
+        self.last_status = status
         if status != 0:
-            logger.warning(f"Z measure status={status} at f={freq:.1f} Hz")
+            logger.warning(f"Z measure status={status} "
+                           f"({FETCH_STATUS.get(status, '未知')}) at f={freq:.1f} Hz")
+        if status in INVALID_STATUS:
+            # 9.9E37 当成 |Z| 存下去, 在 √|Z| 加权的拟合里一个点的残差就有 ~3e18
+            return complex(np.nan, np.nan)
 
         theta = np.deg2rad(theta_deg)
         return z_mag * np.exp(1j * theta)

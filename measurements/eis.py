@@ -45,10 +45,13 @@ def run_eis_channel(instrument, channel: int, config: Dict,
     settle = float(eis.get('settle_time', 0.08))
 
     z_raw = []
+    statuses = []
     for index, f in enumerate(freqs, start=1):
         z = instrument.measure_complex_z(f, vac, vdc, averaging=avg,
                                          settle_time=settle)
         z_raw.append(z)
+        # 仿真器没有状态码, 一律当作正常
+        statuses.append(int(getattr(instrument, 'last_status', 0)))
         if on_point is not None:
             z_display = calibration.correct(z, float(f)) if calibration is not None \
                 and calibration.calibrated else z
@@ -60,6 +63,7 @@ def run_eis_channel(instrument, channel: int, config: Dict,
         'channel': channel,
         'freq': freqs,
         'z_raw': z_raw,
+        'status': np.asarray(statuses, dtype=int),
     }
 
     if calibration is not None and calibration.calibrated:
@@ -74,6 +78,11 @@ def run_eis_channel(instrument, channel: int, config: Dict,
 
     logger.info(f"Channel {channel}: EIS scan done, {len(freqs)} points "
                 f"(calibrated={calibration is not None and calibration.calibrated})")
+    n_invalid = int(np.sum(~np.isfinite(z_raw)))
+    n_flagged = int(np.sum(result['status'] != 0)) - n_invalid
+    if n_invalid or n_flagged:
+        logger.warning(f"Channel {channel}: {n_invalid} 个无效点 (记为 NaN), "
+                       f"{n_flagged} 个点仪器状态非 0 (数值保留, 见 CSV status 列)")
     return result
 
 
@@ -83,7 +92,9 @@ def z_to_cpg(z: np.ndarray, freqs: np.ndarray):
 
     Y = 1/Z = Gp + jωCp
     """
-    y = 1.0 / z
+    # 无效点 (NaN) 照样算出 NaN 即可, 不必每次刷 RuntimeWarning
+    with np.errstate(invalid='ignore', divide='ignore'):
+        y = 1.0 / z
     gp = y.real
     omega = 2.0 * np.pi * freqs
     cp = y.imag / omega

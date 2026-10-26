@@ -32,7 +32,7 @@ measurement:
   bias_settle_s: 0.5       # 切换直流偏压后、开始扫频前的稳定时间 (秒)
 
   eis:
-    v_dc: 0.0              # V, 直流偏压
+    v_dc: 0.7              # V, 直流偏压
     v_ac: 0.03             # Vrms, 交流幅值 (30 mV)
     freq_start: 20         # Hz
     freq_stop: 1.0e6       # Hz (4284A 上限 1 MHz)

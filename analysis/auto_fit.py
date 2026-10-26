@@ -40,7 +40,7 @@ def find_latest_csv(output_dir: str) -> list:
     """返回最新一次扫描对应的 CSV 列表 (按偏压排序).
 
     - 若最新文件位于 bias_sequence_* 目录: 返回该序列下全部 bias_*/eis_ch*.csv
-    - 否则: 仅返回该最新文件本身
+    - 否则: 返回最新文件所在目录下的全部通道 CSV (多通道单次扫描不能只拟合一个通道)
     """
     hits = []
     for root, _dirs, files in os.walk(output_dir):
@@ -69,7 +69,9 @@ def find_latest_csv(output_dir: str) -> list:
         out.sort(key=lambda p: (_bias_from_folder(
             os.path.basename(os.path.dirname(p))), os.path.getmtime(p)))
         return out
-    return [newest]
+    folder = os.path.dirname(newest)
+    return sorted(os.path.join(folder, f) for f in os.listdir(folder)
+                  if re.match(r'eis_ch\d+\.csv$', f))
 
 
 def fit_csv(path: str) -> dict:
@@ -77,6 +79,11 @@ def fit_csv(path: str) -> dict:
     df = pd.read_csv(path)
     freq = df['freq [Hz]'].values.astype(float)
     z = df['Z_real [ohm]'].values + 1j * df['Z_imag [ohm]'].values
+    # 仪器状态 -1/1/2 的点存的是 NaN, 留着会让 least_squares 直接报错
+    keep = np.isfinite(freq) & np.isfinite(z)
+    freq, z = freq[keep], z[keep]
+    if len(freq) == 0:
+        raise ValueError(f'没有有效数据点: {path}')
 
     res = {
         'path': path,

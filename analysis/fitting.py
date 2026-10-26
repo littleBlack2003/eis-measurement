@@ -14,6 +14,11 @@ from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Rs(RpCPE) 的多起点网格: CPE 指数 n 的误差面几乎平坦 (见 fit_equivalent_circuit
+# 里的实测注释), 单一初值会让 Rs 和 n 变成"初值的函数"而不是"数据的函数"。
+# 覆盖 0.6–0.99 的典型区间, 跑完取误差最小者。
+CPE_N_STARTS = (0.60, 0.70, 0.80, 0.90, 0.95, 0.99)
+
 
 def model_rs_rpc(freq: np.ndarray, rs: float, rp: float, c: float) -> np.ndarray:
     """Rs + (Rp || C) 模型复数阻抗."""
@@ -77,7 +82,17 @@ def fit_equivalent_circuit(freq: np.ndarray, z: np.ndarray,
     # 取高频段最小实部作上界 (物理严格); 实测比"中位数×1.2"更自洽——
     # 后者在真实数据上会让 Rs 撞界并超出 min(Re Z), 高频段误差也更高。
     n_hi = min(5, len(f))
-    rs_hi = max(float(np.min(zf.real[-n_hi:])), 1e-3)
+    hi_re = zf.real[-n_hi:]
+    rs_hi = float(np.min(hi_re))
+    if rs_hi <= 0.0:
+        # 高频实部出现非正值 —— 实测遇到过: 引线/夹具的串联电感把高频相位推过
+        # -90° (628 kHz 处 Re Z = -0.93 Ω), 或噪声所致。此时 "Rs <= min(Re Z)"
+        # 这条物理约束已经失效, 再拿它当上界会把 Rs 死死压在 1e-3 的下界上
+        # (实测拟合出 Rs=0.001 Ω 这种毫无意义的值), 必须换一个正的上界。
+        rs_hi = float(np.median(hi_re))
+        if rs_hi <= 0.0:
+            rs_hi = float(np.median(np.abs(zf[-n_hi:])))
+    rs_hi = max(rs_hi, 1e-3)
     # 中位数 >= 最小值, 直接用 rs0 会超出上界而触发 least_squares 报错
     rs_start = min(rs0, rs_hi * 0.99)
 
@@ -110,7 +125,29 @@ def fit_equivalent_circuit(freq: np.ndarray, z: np.ndarray,
         diff = (z_model - zf) / weights
         return np.concatenate([diff.real, diff.imag])
 
-    res = least_squares(residual, p0, bounds=(lower, upper), max_nfev=max_nfev)
+    if use_cpe:
+        # CPE 的 landscape 对 n 的初值极其敏感, 单一初值会锁死结果。
+        # 实测 (2026-10-14, 五份 0.7 V 扫描): 只改 n 的初值, 同一份数据的
+        #   Rs  在 0.12 – 7.90 Ω 之间漂移 (**67 倍**)
+        #   n   在 0.83 – 0.98 之间漂移 (0.15)
+        #   而归一化误差只从 1.18% 变到 4.04% (3.4 倍)
+        # —— 即误差面在 (Rs, n) 方向上几乎平坦, 拟合器停在哪纯看从哪出发。
+        # 写死的 n0=0.95 曾让 20:05 那次拟合输出 n=0.9500 (与初值逐位相同),
+        # 而换个起点误差能从 1.87% 降到 1.18%。Rp 不受影响 (漂移 <2%)。
+        # 故改为多起点: 全部跑一遍, 取归一化误差最小的那个。
+        best_res, best_err = None, np.inf
+        for n0 in CPE_N_STARTS:
+            trial = least_squares(residual, [p0[0], p0[1], p0[2], n0],
+                                  bounds=(lower, upper), max_nfev=max_nfev)
+            z_hat = model_rs_rpcpe(f, *trial.x)
+            trial_err = (np.sqrt(np.mean(np.abs(z_hat - zf) ** 2))
+                         / np.sqrt(np.mean(np.abs(zf) ** 2)))
+            if trial_err < best_err:
+                best_res, best_err = trial, trial_err
+        res = best_res
+    else:
+        res = least_squares(residual, p0, bounds=(lower, upper),
+                            max_nfev=max_nfev)
 
     params = res.x
     # 参数不确定性 (从雅可比近似协方差)

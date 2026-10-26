@@ -108,8 +108,15 @@ def run_calibration(instrument, relay, config: dict, out_dir: str,
         for f in freqs:
             if check_cancel is not None:
                 check_cancel()
-            values.append(instrument.measure_complex_z(f, vac, vdc, averaging=avg))
-        return np.asarray(values)
+            values.append(instrument.measure_complex_z(f, vac, vdc, averaging=avg,
+                                                       settle_time=settle))
+        values = np.asarray(values)
+        n_bad = int(np.sum(~np.isfinite(values)))
+        if n_bad:
+            # 校准里的 NaN 会让以后每次用这份校准测出的同一频点都变成 NaN
+            logger.warning(f"校准谱中有 {n_bad} 个无效点 (仪器状态 -1/1/2), "
+                           f"这些频点的修正结果将为 NaN, 建议重做校准")
+        return values
 
     for ch in channels:
         if check_cancel is not None:
@@ -209,6 +216,13 @@ def main():
             run_eis(instrument, relay, config, out_dir, calibration_store)
 
     finally:
+        # 测量结束必须撤掉直流偏压：驱动只在每次采样时设置偏压、不会自己关掉，
+        # 漏掉这一步会让 0.7 V 一直加在器件上（GUI 的 _run_worker 有这个保护，CLI 原本没有）。
+        if hasattr(instrument, 'disable_dc_bias'):
+            try:
+                instrument.disable_dc_bias()
+            except Exception:
+                logger.exception("关闭直流偏压失败")
         if relay is not None:
             relay.close()
         instrument.close()
