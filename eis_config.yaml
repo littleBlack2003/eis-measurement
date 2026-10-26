@@ -40,11 +40,25 @@ measurement:
     averaging: 3
     settle_time: 0.08      # 每频点稳定时间 (秒)
 
+  # 活性层电容: 固定偏压扫 C-f, 由高频平台读几何电容
+  capacitance:
+    v_dc: 0.0              # V, 通常取 0 V 或反偏
+
+  # 热导纳谱: 手动控温, 每个温度点提示操作员调温并输入实测温度
+  tas:
+    temperatures: "300:200:20"    # K, 起点:终点:步长(取正, 方向由起止决定) 或 逗号列表
+    v_dc: 0.0              # V
+
   calibration:
     enabled: true
     # 开路/短路校准使用的频率点 (自动取与 EIS 扫描相同的频率轴)
     averaging: 5
     settle_time: 0.1
+
+sample:
+  area_cm2: 0.1            # 电极面积 cm²
+  epsilon_r: null          # 活性层相对介电常数 (已知则换算厚度)
+  thickness_nm: null       # 活性层厚度 nm (已知则换算介电常数)
 
 output:
   directory: "./data"
@@ -56,7 +70,10 @@ output:
 simulator:
   # 每个通道模拟一个不同的 RC 网络, 用于验证校准与多通道切换逻辑
   channels:
-    0: {series_resistance: 25.0,  shunt_resistance: 1.0e7, capacitance: 2.0e-9}
+    # trap: 温度相关的陷阱响应 (C_t, 激活能 eV, 前因子 ξ0), 用于验证热导纳谱分析;
+    # 200–300 K 时发射峰约在 230 Hz – 10 kHz
+    0: {series_resistance: 25.0,  shunt_resistance: 1.0e7, capacitance: 2.0e-9,
+        trap: {capacitance: 3.0e-9, energy: 0.15, xi0: 100.0}}
     1: {series_resistance: 40.0,  shunt_resistance: 5.0e6,  capacitance: 5.0e-9}
     2: {series_resistance: 15.0,  shunt_resistance: 2.0e7,  capacitance: 1.0e-9}
     3: {series_resistance: 60.0,  shunt_resistance: 1.0e6,  capacitance: 8.0e-9}

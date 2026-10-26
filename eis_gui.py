@@ -23,6 +23,9 @@ from eis_main import create_instrument, create_relay, run_calibration, run_eis
 from cal.calibration import CalibrationStore
 from measurements.eis import build_freq_axis
 from analysis.auto_fit import fit_csv, find_latest_csv
+from analysis.fitting import DEFAULT_WEIGHTING
+from analysis.capacitance import analyze_cf_run
+from analysis.tas import MANIFEST as TAS_MANIFEST, analyze_tas, save_tas_results
 
 
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) \
@@ -55,42 +58,64 @@ class ScanCancelled(Exception):
     pass
 
 
-def parse_bias_sequence(text):
-    """解析 0:1:0.1 或 -0.5,0,0.5 形式的偏压序列。"""
+def parse_sequence(text, name, unit, minimum, maximum, example):
+    """解析 起点:终点:步长 或 逗号列表 形式的数值序列（偏压、温度共用）。"""
     spec = text.strip().replace('，', ',')
     if not spec:
-        raise ValueError('请填写偏压序列。')
+        raise ValueError(f'请填写{name}序列。')
     try:
         if ':' in spec:
             parts = [Decimal(part.strip()) for part in spec.split(':')]
             if len(parts) != 3:
-                raise ValueError('范围格式应为 起点:终点:步长，例如 0:1:0.1。')
+                raise ValueError(f'范围格式应为 起点:终点:步长，例如 {example}。')
             start, stop, step = parts
             if step <= 0:
-                raise ValueError('偏压步长必须大于 0。')
+                raise ValueError(f'{name}步长必须大于 0（方向由起点和终点决定）。')
             direction = 1 if stop >= start else -1
             values = []
             value = start
             while (value <= stop if direction == 1 else value >= stop):
                 values.append(value)
                 if len(values) > 200:
-                    raise ValueError('偏压点不能超过 200 个。')
+                    raise ValueError(f'{name}点不能超过 200 个。')
                 value += direction * step
             if values[-1] != stop:
                 values.append(stop)
         else:
             values = [Decimal(part.strip()) for part in spec.split(',') if part.strip()]
     except InvalidOperation as exc:
-        raise ValueError('偏压序列中有无效数字。') from exc
+        raise ValueError(f'{name}序列中有无效数字。') from exc
     if not values:
-        raise ValueError('请填写至少一个偏压值。')
+        raise ValueError(f'请填写至少一个{name}值。')
     if len(values) > 200:
-        raise ValueError('偏压点不能超过 200 个。')
-    if any(not value.is_finite() or value < -40 or value > 40 for value in values):
-        raise ValueError('偏压值必须在 -40 V 到 +40 V 之间。')
+        raise ValueError(f'{name}点不能超过 200 个。')
+    if any(not value.is_finite() or value < minimum or value > maximum for value in values):
+        raise ValueError(f'{name}值必须在 {minimum} {unit} 到 {maximum} {unit} 之间。')
     if len(set(values)) != len(values):
-        raise ValueError('偏压序列中不能有重复值。')
+        raise ValueError(f'{name}序列中不能有重复值。')
     return [float(value) for value in values]
+
+
+def parse_bias_sequence(text):
+    """解析 0:1:0.1 或 -0.5,0,0.5 形式的偏压序列。"""
+    return parse_sequence(text, '偏压', 'V', -40, 40, '0:1:0.1')
+
+
+def parse_temperature_sequence(text):
+    """解析 300:200:20 或 300,250,200 形式的温度序列（K）。"""
+    return parse_sequence(text, '温度', 'K', 4, 700, '300:200:20')
+
+
+def parse_optional_float(value, name, minimum=None, maximum=None):
+    """可留空的数值：空串返回 None。"""
+    if not str(value).strip():
+        return None
+    return parse_float(value, name, minimum=minimum, maximum=maximum, allow_zero=False)
+
+
+def temperature_folder_name(kelvin):
+    text = format(Decimal(str(kelvin)).normalize(), 'f').replace('.', 'p')
+    return f'T_{text}K'
 
 
 def parse_int(value, name, minimum=None, maximum=None):
@@ -132,6 +157,18 @@ CAL_MODES = {
     'none': '不校准（原始数据）',
 }
 CAL_FILE = 'calibration.json'
+
+# 拟合残差加权: 界面文字 <-> fitting.WEIGHTINGS
+FIT_WEIGHTINGS = {
+    'sqrt': '√|Z| 加权（默认）',
+    'modulus': '1/|Z| 相对加权',
+    'unit': '不加权',
+}
+
+# 测量模式 -> 显示名 / 输出子目录前缀
+MODE_LABELS = {'single': '完整扫描', 'bias': '偏压序列', 'cf': '活性层电容测量',
+               'tas': '热导纳谱'}
+MODE_PREFIX = {'single': 'scan_', 'bias': 'bias_sequence_', 'cf': 'cf_', 'tas': 'tas_'}
 
 
 def cal_mode_from_config(calibration):
@@ -204,6 +241,9 @@ class EISGui:
         self.fit_results = []
         self._last_axis_update = 0.0
         self.run_total = 0                # 本次测量的总点数（全部偏压 × 通道 × 频点）
+        self.temp_response = None         # 调温弹窗与工作线程之间的应答
+        self.temp_result = None
+        self.ana_series = []              # 分析图里的曲线，重新分析时先删掉
         self.run_started = 0.0
         try:
             with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
@@ -227,6 +267,8 @@ class EISGui:
     OK_GREEN = (26, 138, 76, 255)         # 成功／就绪
     WARN_AMBER = (186, 126, 20, 255)      # 警告
     ERR_RED = (198, 60, 48, 255)          # 失败
+    INPUT_BORDER = (138, 152, 170, 255)   # 输入框边框：比面板分隔线深一档，白底上清楚可见
+    INPUT_BG = (251, 252, 254, 255)       # 输入框底色：略带冷灰，和纯白面板区分开
     # 左右分栏：左栏放连接/测量参数，右栏放数据窗口
     LEFT_WIDTH = 470                      # 左栏总宽
     LEFT_CONTENT = 440                    # 左栏可用内容宽（说明文字换行用）
@@ -306,6 +348,21 @@ class EISGui:
                 for name, rgb in self.LIGHT_PLOTS.items():
                     dpg.add_theme_color(getattr(dpg, 'mvPlotCol_' + name), (*rgb, 255),
                                         category=dpg.mvThemeCat_Plots)
+                # 文本光标：默认跟随正文颜色且很细，改成强调蓝，输入时一眼能看到落点
+                dpg.add_theme_color(dpg.mvThemeCol_InputTextCursor, self.ACCENT,
+                                    category=dpg.mvThemeCat_Core)
+            # 输入类控件加边框：FrameBg 与面板同为白色、ImGui 默认边框宽度为 0，
+            # 输入框、下拉框、勾选框原本看起来就是一行普通文字，找不到可以点哪里输入。
+            # 只给这几类控件加，按钮保持原样。
+            for component in (dpg.mvInputText, dpg.mvInputInt, dpg.mvInputFloat,
+                              dpg.mvCombo, dpg.mvCheckbox):
+                with dpg.theme_component(component):
+                    dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 1,
+                                        category=dpg.mvThemeCat_Core)
+                    dpg.add_theme_color(dpg.mvThemeCol_Border, self.INPUT_BORDER,
+                                        category=dpg.mvThemeCat_Core)
+                    dpg.add_theme_color(dpg.mvThemeCol_FrameBg, self.INPUT_BG,
+                                        category=dpg.mvThemeCat_Core)
         dpg.bind_theme('app_theme')
 
     def _button_themes(self):
@@ -317,6 +374,8 @@ class EISGui:
         schemes = (
             ('start_button', (45, 125, 78), (56, 150, 94), (68, 172, 108)),
             ('bias_start_button', (38, 108, 152), (48, 132, 182), (60, 152, 206)),
+            ('cf_start_button', (112, 84, 160), (132, 102, 184), (150, 120, 204)),
+            ('tas_start_button', (176, 104, 32), (200, 122, 44), (220, 140, 58)),
             ('stop_button', (176, 62, 62), (204, 74, 74), (228, 90, 90)),
         )
         for tag, base, hover, active in schemes:
@@ -384,6 +443,13 @@ class EISGui:
         eis = measurement.get('eis', {})
         calibration = measurement.get('calibration', {})
         output = self.config.get('output', {})
+        sample = self.config.get('sample') or {}
+        capacitance = measurement.get('capacitance') or {}
+        tas = measurement.get('tas') or {}
+
+        def opt(value):
+            """可留空的参数：None 显示成空框。"""
+            return '' if value is None else str(value)
 
         dpg.create_context()
         # 注意：DearPyGui 2.3.1 的 create_viewport(title=...) 传入中文会在首帧渲染时
@@ -477,6 +543,30 @@ class EISGui:
                         self._hint('格式：起点:终点:步长（例如 1:-1:0.2）；或逗号列表（0,0.2,0.5）。'
                                    '切换偏压后先等待上述时间，再开始该偏压的整段扫描。',
                                    width=self.LEFT_CONTENT)
+                    with dpg.collapsing_header(label='活性层电容（C-f）', default_open=False):
+                        with dpg.group(horizontal=True):
+                            dpg.add_input_text(label='电极面积 cm²', default_value=opt(
+                                sample.get('area_cm2', 0.1)), tag='sample_area', width=90)
+                            dpg.add_input_text(label='C-f 偏压 V', default_value=str(
+                                capacitance.get('v_dc', 0.0)), tag='cf_v_dc', width=80)
+                        with dpg.group(horizontal=True):
+                            dpg.add_input_text(label='相对介电常数 εr', default_value=opt(
+                                sample.get('epsilon_r')), tag='eps_r', width=80)
+                            dpg.add_input_text(label='厚度 nm', default_value=opt(
+                                sample.get('thickness_nm')), tag='thickness_nm', width=80)
+                        self._hint('按“测量参数”的频率范围在固定偏压下扫 C-f，取高频平台为几何电容 '
+                                   'C_geo。填 εr 换算厚度 d = ε0·εr·A / C_geo；填厚度则反算 εr；'
+                                   '两项都可留空。偏压通常取 0 V 或反偏。', width=self.LEFT_CONTENT)
+                    with dpg.collapsing_header(label='热导纳谱（TAS，手动控温）', default_open=False):
+                        dpg.add_input_text(label='温度序列 K', default_value=str(
+                            tas.get('temperatures', '300:200:20')), tag='tas_temps', width=220,
+                            callback=self._on_param_change)
+                        dpg.add_input_text(label='TAS 偏压 V', default_value=str(
+                            tas.get('v_dc', 0.0)), tag='tas_v_dc', width=80)
+                        self._hint('每个温度点：程序先关掉直流偏压，弹窗请你把温度调到目标值、'
+                                   '等稳定后填入实测温度，再扫一条 C-f。全部温度完成后取 '
+                                   '-dC/dln f 的峰为发射频率，按 ln(ω0/T²)–1/T 拟合激活能。'
+                                   '开路/短路校准只在开始时做一次。', width=self.LEFT_CONTENT)
                     dpg.add_separator()
                     dpg.add_input_text(label='输出目录', default_value=str(
                         output.get('directory', './data')), tag='output_dir', width=330,
@@ -489,8 +579,9 @@ class EISGui:
                                        callback=self._default_output, width=130, height=30)
                         dpg.add_button(label='打开目录', callback=self._open_output_dir,
                                        width=120, height=30)
-                    self._hint('每次测量都会在输出目录下新建 scan_时间 或 bias_sequence_时间 '
-                               '子目录，不会覆盖以前的数据。', width=self.LEFT_CONTENT)
+                    self._hint('每次测量都会在输出目录下新建带时间戳的子目录（scan_ / '
+                               'bias_sequence_ / cf_ / tas_），不会覆盖以前的数据。',
+                               width=self.LEFT_CONTENT)
                     dpg.add_separator()
                     dpg.add_text('', tag='run_summary', wrap=self.LEFT_CONTENT)
                     with dpg.group(horizontal=True):
@@ -499,6 +590,13 @@ class EISGui:
                                        width=200, height=38)
                         dpg.add_button(label='扫描偏压序列', tag='bias_start_button',
                                        callback=self._start, user_data='bias',
+                                       width=200, height=38)
+                    with dpg.group(horizontal=True):
+                        dpg.add_button(label='测量活性层电容', tag='cf_start_button',
+                                       callback=self._start, user_data='cf',
+                                       width=200, height=38)
+                        dpg.add_button(label='开始热导纳谱', tag='tas_start_button',
+                                       callback=self._start, user_data='tas',
                                        width=200, height=38)
                     with dpg.group(horizontal=True):
                         dpg.add_button(label='停止扫描', tag='stop_button',
@@ -557,9 +655,18 @@ class EISGui:
                                                   auto_fit=True)
                                 dpg.add_plot_axis(dpg.mvYAxis, label='Phase [degree]',
                                                   tag='phase_y', auto_fit=True)
+                        with dpg.tab(label='C-f'):
+                            with dpg.plot(label='Capacitance (parallel model)', tag='plot_cf',
+                                          width=self.CONTENT_WIDTH, height=300):
+                                dpg.add_plot_legend()
+                                dpg.add_plot_axis(dpg.mvXAxis, label='Frequency [Hz]',
+                                                  tag='cf_x', scale=dpg.mvPlotScale_Log10,
+                                                  auto_fit=True)
+                                dpg.add_plot_axis(dpg.mvYAxis, label='C_p [nF]',
+                                                  tag='cf_y', auto_fit=True)
                     dpg.add_separator()
                     with dpg.collapsing_header(label='数据处理（等效电路拟合）',
-                                               default_open=True):
+                                               tag='fit_header', default_open=True):
                         with dpg.group(horizontal=True):
                             dpg.add_button(label='拟合最新数据', tag='fit_latest_button',
                                            callback=self._fit_latest_clicked,
@@ -567,9 +674,16 @@ class EISGui:
                             dpg.add_checkbox(label='扫描完成后自动拟合', default_value=bool(
                                 (measurement.get('fitting') or {}).get('auto_fit', True)),
                                 tag='auto_fit')
-                        self._hint('自动比较 Rs(RpC) 与 Rs(RpCPE) 两个模型并取误差较小者；'
-                                   '残差按 √|Z| 加权，Rs 受限于 min(Re Z)。'
-                                   '|Z| 中位 < 20 Ω 的数据判定为短路，不参与拟合。')
+                            dpg.add_combo(list(FIT_WEIGHTINGS.values()), label='残差加权',
+                                          default_value=FIT_WEIGHTINGS.get(
+                                              (measurement.get('fitting') or {}).get(
+                                                  'weighting', DEFAULT_WEIGHTING),
+                                              FIT_WEIGHTINGS[DEFAULT_WEIGHTING]),
+                                          tag='fit_weighting', width=170)
+                        self._hint('比较 Rs(RpC) 与 Rs(RpCPE)，高频出现感性点（Im Z > 0）时再加入带串联'
+                                   '电感 L 的模型，按 BIC 选择（对参数个数加罚，避免总选复杂模型）。'
+                                   'Rs 受限于 min(Re Z)，贴住该上限时会标注。'
+                                   '|Z| 中位 < 20 Ω 判定为短路，不参与拟合。')
                         with dpg.group(horizontal=True):
                             with dpg.plot(label='Nyquist 拟合', tag='fit_plot_nyq',
                                           width=425, height=290):
@@ -599,12 +713,40 @@ class EISGui:
                                            borders_innerV=True, borders_outerV=True,
                                            scrollY=True):
                                 for col in ('数据集', '模型', 'Rs [Ω]', 'Rp [Ω]',
-                                            'C [F] / Q', 'n', 'τ [s]', '误差'):
+                                            'C [F] / Q', 'n', 'L [H]', 'τ [s]', '相对误差'):
                                     dpg.add_table_column(label=col)
                         dpg.add_input_text(tag='fit_summary', multiline=True, readonly=True,
                                            width=self.CONTENT_WIDTH, height=110,
                                            default_value='暂无拟合结果。点击“拟合最新数据”，'
                                                          '或勾选“扫描完成后自动拟合”。')
+                    with dpg.collapsing_header(label='活性层电容 / 热导纳谱分析',
+                                               tag='analysis_header', default_open=False):
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(label='分析最新 C-f / TAS 数据',
+                                           tag='analyze_latest_button',
+                                           callback=self._analyze_latest_clicked,
+                                           width=210, height=30)
+                            self._hint('C-f、TAS 测量结束后会自动分析；结果图和 CSV 存在该次测量目录。',
+                                       width=560)
+                        with dpg.group(horizontal=True):
+                            with dpg.plot(label='-dC/dln f', tag='ana_plot_left',
+                                          width=425, height=290):
+                                dpg.add_plot_legend()
+                                dpg.add_plot_axis(dpg.mvXAxis, label='Frequency [Hz]',
+                                                  tag='ana_left_x', scale=dpg.mvPlotScale_Log10,
+                                                  auto_fit=True)
+                                dpg.add_plot_axis(dpg.mvYAxis, label='[nF]',
+                                                  tag='ana_left_y', auto_fit=True)
+                            with dpg.plot(label='Arrhenius', tag='ana_plot_right',
+                                          width=425, height=290):
+                                dpg.add_plot_legend()
+                                dpg.add_plot_axis(dpg.mvXAxis, label='1000/T [1/K]',
+                                                  tag='ana_right_x', auto_fit=True)
+                                dpg.add_plot_axis(dpg.mvYAxis, label='ln(omega0/T^2)',
+                                                  tag='ana_right_y', auto_fit=True)
+                        dpg.add_input_text(tag='analysis_summary', multiline=True, readonly=True,
+                                           width=self.CONTENT_WIDTH, height=110,
+                                           default_value='暂无结果。')
                     dpg.add_separator()
                     with dpg.group(horizontal=True):
                         dpg.add_text('运行日志')
@@ -621,6 +763,20 @@ class EISGui:
                 dpg.add_button(label='继续', callback=self._answer_prompt, user_data=True, width=120)
                 dpg.add_button(label='取消校准', callback=self._answer_prompt,
                                user_data=False, width=120)
+
+        with dpg.window(label='调节温度', tag='temp_dialog', modal=True,
+                        show=False, no_title_bar=True, width=480, height=230):
+            dpg.add_text('', tag='temp_step', color=self.ACCENT)
+            dpg.add_text('', tag='temp_prompt', wrap=450)
+            dpg.add_input_text(label='实测温度 K', tag='temp_actual', width=120,
+                               on_enter=True, callback=self._answer_temperature,
+                               user_data=True)
+            dpg.add_text('', tag='temp_error', color=self.ERR_RED)
+            with dpg.group(horizontal=True):
+                dpg.add_button(label='温度已稳定，开始测量', callback=self._answer_temperature,
+                               user_data=True, width=200)
+                dpg.add_button(label='停止热导纳谱', callback=self._answer_temperature,
+                               user_data=False, width=140)
 
         with dpg.window(label='提示', tag='message_dialog', modal=True, show=False,
                         no_title_bar=False, width=520, height=220):
@@ -665,12 +821,14 @@ class EISGui:
         'freq_start', 'freq_stop', 'v_dc', 'v_ac', 'points', 'averaging', 'settle_time',
         'cal_mode', 'cal_confirm', 'bias_sequence', 'bias_settle',
         'output_dir', 'browse_button', 'default_dir_button', 'save_config_button',
-        'fit_latest_button',
+        'fit_latest_button', 'analyze_latest_button', 'fit_weighting',
+        'sample_area', 'cf_v_dc', 'eps_r', 'thickness_nm', 'tas_temps', 'tas_v_dc',
     )
+    START_BUTTONS = ('start_button', 'bias_start_button', 'cf_start_button', 'tas_start_button')
 
     def _set_running(self, running):
-        dpg.configure_item('start_button', enabled=not running)
-        dpg.configure_item('bias_start_button', enabled=not running)
+        for tag in self.START_BUTTONS:
+            dpg.configure_item(tag, enabled=not running)
         dpg.configure_item('stop_button', enabled=running)
         for tag in self.LOCKED_WHILE_RUNNING:
             if dpg.does_item_exist(tag):
@@ -703,6 +861,11 @@ class EISGui:
             text += f'\n偏压序列：{n_bias} 个偏压，共 {n_freq * n_ch * n_bias} 点'
         except ValueError as exc:
             text += f'\n偏压序列无效：{exc}'
+        try:
+            n_temp = len(parse_temperature_sequence(dpg.get_value('tas_temps')))
+            text += f'\n热导纳谱：{n_temp} 个温度，共 {n_freq * n_ch * n_temp} 点（另加调温时间）'
+        except ValueError as exc:
+            text += f'\n温度序列无效：{exc}'
         dpg.set_value('run_summary', text)
         dpg.configure_item('run_summary', color=self.ACCENT)
 
@@ -760,12 +923,13 @@ class EISGui:
         content = max(400, right_w - 26)
         dpg.configure_item('left_panel', height=height)
         dpg.configure_item('right_panel', width=right_w, height=height)
-        for item in ('plot_nyquist', 'plot_magnitude', 'plot_phase'):
+        for item in ('plot_nyquist', 'plot_magnitude', 'plot_phase', 'plot_cf'):
             dpg.configure_item(item, width=content)
         half = max(200, (content - 10) // 2)
-        for item in ('fit_plot_nyq', 'fit_plot_bode'):
+        for item in ('fit_plot_nyq', 'fit_plot_bode', 'ana_plot_left', 'ana_plot_right'):
             dpg.configure_item(item, width=half)
-        for item in ('fit_table_win', 'fit_table', 'fit_summary', 'log_text'):
+        for item in ('fit_table_win', 'fit_table', 'fit_summary', 'analysis_summary',
+                     'log_text'):
             dpg.configure_item(item, width=content)
         self._apply_vertical_layout(height)
 
@@ -780,6 +944,8 @@ class EISGui:
         if surplus <= 0:
             plan = {
                 'plot_nyquist': 300, 'plot_magnitude': 300, 'plot_phase': 300,
+                'plot_cf': 300, 'ana_plot_left': 290, 'ana_plot_right': 290,
+                'analysis_summary': 110,
                 'fit_plot_nyq': 290, 'fit_plot_bode': 290,
                 'fit_table_win': 150, 'fit_table': 150,
                 'fit_summary': 110, 'log_text': 170,
@@ -789,6 +955,10 @@ class EISGui:
                 'plot_nyquist': 300 + surplus * 0.30,
                 'plot_magnitude': 300 + surplus * 0.30,
                 'plot_phase': 300 + surplus * 0.30,
+                'plot_cf': 300 + surplus * 0.30,
+                'ana_plot_left': 290 + surplus * 0.25,
+                'ana_plot_right': 290 + surplus * 0.25,
+                'analysis_summary': 110 + surplus * 0.10,
                 'fit_plot_nyq': 290 + surplus * 0.25,
                 'fit_plot_bode': 290 + surplus * 0.25,
                 'fit_table_win': 150 + surplus * 0.20,
@@ -798,7 +968,9 @@ class EISGui:
             }
         limits = {
             'plot_nyquist': (300, 620), 'plot_magnitude': (300, 620),
-            'plot_phase': (300, 620),
+            'plot_phase': (300, 620), 'plot_cf': (300, 620),
+            'ana_plot_left': (290, 520), 'ana_plot_right': (290, 520),
+            'analysis_summary': (110, 220),
             'fit_plot_nyq': (290, 520), 'fit_plot_bode': (290, 520),
             'fit_table_win': (150, 320), 'fit_table': (150, 320),
             'fit_summary': (110, 220), 'log_text': (170, 340),
@@ -1006,6 +1178,20 @@ class EISGui:
         calibration['confirm_after'] = dpg.get_value('cal_confirm')
         config['measurement'].setdefault('fitting', {})
         config['measurement']['fitting']['auto_fit'] = dpg.get_value('auto_fit')
+        config['measurement']['fitting']['weighting'] = self._fit_weighting()
+        config['measurement'].setdefault('capacitance', {})['v_dc'] = parse_float(
+            dpg.get_value('cf_v_dc'), 'C-f 偏压 V', minimum=-40, maximum=40)
+        tas = config['measurement'].setdefault('tas', {})
+        tas['temperatures'] = dpg.get_value('tas_temps').strip()
+        tas['v_dc'] = parse_float(dpg.get_value('tas_v_dc'), 'TAS 偏压 V',
+                                  minimum=-40, maximum=40)
+        sample = config.setdefault('sample', {})
+        sample['area_cm2'] = parse_optional_float(dpg.get_value('sample_area'),
+                                                  '电极面积 cm²', minimum=0)
+        sample['epsilon_r'] = parse_optional_float(dpg.get_value('eps_r'),
+                                                   '相对介电常数 εr', minimum=1, maximum=1000)
+        sample['thickness_nm'] = parse_optional_float(dpg.get_value('thickness_nm'),
+                                                      '厚度 nm', minimum=0)
         config.setdefault('output', {})
         config['output']['directory'] = dpg.get_value('output_dir').strip() or './data'
         return config
@@ -1029,10 +1215,14 @@ class EISGui:
         if self._busy_with_connection():
             self._show_message('仪器占用中', '正在测试连接或枚举资源，请稍候再开始测量。')
             return
+        mode = user_data or 'single'
         try:
             saved = self._settings()
-            biases = parse_bias_sequence(saved['measurement']['bias_sequence']) \
-                if user_data == 'bias' else None
+            sequence = None
+            if mode == 'bias':
+                sequence = parse_bias_sequence(saved['measurement']['bias_sequence'])
+            elif mode == 'tas':
+                sequence = parse_temperature_sequence(saved['measurement']['tas']['temperatures'])
             config = copy.deepcopy(saved)
             config['output']['directory'] = self._resolved_output_dir()
             # “复用校准”在开始前就检查：等仪器连上、跑到一半才报错太晚了
@@ -1053,19 +1243,20 @@ class EISGui:
         n_freq = len(build_freq_axis(eis['freq_start'], eis['freq_stop'],
                                      eis['points_per_decade']))
         self.run_total = n_freq * len(config['measurement']['channels']) * \
-            (len(biases) if biases is not None else 1)
+            (len(sequence) if sequence is not None else 1)
         self._points_done = 0
         self.cancel_event.clear()
         self._set_running(True)
-        dpg.set_value('status', '偏压序列运行中…' if biases is not None else '测量运行中…')
+        dpg.set_value('status', f'{MODE_LABELS[mode]}运行中…')
         dpg.configure_item('status', color=self.ACCENT)
         self._reset_live_curves()
         dpg.configure_item('progress', overlay=f'0 / {self.run_total} 点')
         self.run_started = time.monotonic()
-        self._append_log(f'开始测量：共 {self.run_total} 点，'
+        self._append_log(f'开始{MODE_LABELS[mode]}：共 {self.run_total} 点，'
                          f'校准方式：{CAL_MODES[self._cal_mode()]}。')
         self.worker = threading.Thread(target=self._run_worker,
-                                       args=(config, biases, calibration_store), daemon=True)
+                                       args=(config, mode, sequence, calibration_store),
+                                       daemon=True)
         self.worker.start()
 
     def _cancel_scan(self, sender=None, app_data=None, user_data=None):
@@ -1091,13 +1282,67 @@ class EISGui:
         if not result.get('continue', False):
             raise CalibrationCancelled('用户取消了校准。')
 
-    def _point_observer(self, channel, frequency, z, index, total, bias=None):
+    def _point_observer(self, channel, frequency, z, index, total, bias=None, label=None):
         self._check_cancelled()
         # 只有工作线程会调用这里，计数不需要加锁
         self._points_done += 1
         self.events.put(('point', bias, channel, frequency, z.real, z.imag,
                          abs(z), math.degrees(cmath.phase(z)),
-                         index, total, self._points_done))
+                         index, total, self._points_done, label))
+
+    def _wait_bias_settle(self, instrument, config, v_dc):
+        """先加上偏压并等稳定时间（可被“停止”打断），再开始扫频。"""
+        if abs(v_dc) > 1e-6 and hasattr(instrument, 'set_dc_bias'):
+            instrument.set_dc_bias(v_dc)
+            settle_s = config['measurement'].get('bias_settle_s', 0)
+            if settle_s and self.cancel_event.wait(settle_s):
+                raise ScanCancelled('扫描已停止。')
+        self._check_cancelled()
+
+    def _request_temperature(self, target, index, total):
+        """弹窗请操作员调温，返回填入的实测温度（K）。"""
+        response = threading.Event()
+        result = {}
+        self.events.put(('temp_prompt', target, index, total, response, result))
+        while not response.wait(timeout=0.2):
+            if self.cancel_event.is_set():
+                self.events.put(('close_temp_prompt',))
+                raise ScanCancelled('已在调温提示处停止热导纳谱。')
+        if not result.get('continue', False):
+            raise ScanCancelled('已在调温提示处停止热导纳谱。')
+        return result['kelvin']
+
+    def _run_tas_sequence(self, instrument, relay, config, temps, calibration_store, run_dir):
+        log = logging.getLogger(__name__)
+        v_dc = config['measurement']['tas']['v_dc']
+        channels = ','.join(map(str, config['measurement']['channels']))
+        rows = []
+        for index, target in enumerate(temps, start=1):
+            self._check_cancelled()
+            # 调温往往要几十分钟，这段时间不让偏压一直加在器件上
+            if hasattr(instrument, 'disable_dc_bias'):
+                instrument.disable_dc_bias()
+            actual = self._request_temperature(target, index, len(temps))
+            if hasattr(instrument, 'set_sample_temperature'):
+                instrument.set_sample_temperature(actual)   # 仅仿真器有
+            label = f'{actual:g} K'
+            self.events.put(('stage', f'热导纳谱 {index}/{len(temps)}：{label}'))
+            log.info('TAS %d/%d: target %g K, actual %g K', index, len(temps), target, actual)
+            self._wait_bias_settle(instrument, config, v_dc)
+            t_config = copy.deepcopy(config)
+            t_config['measurement']['eis']['v_dc'] = v_dc
+            subdir = temperature_folder_name(target)
+            t_config['output']['directory'] = str(run_dir / subdir)
+            started = datetime.now().isoformat(timespec='seconds')
+            run_eis(instrument, relay, t_config, str(run_dir / subdir), calibration_store,
+                    on_point=lambda ch, freq, z, point, total, lb=label:
+                    self._point_observer(ch, freq, z, point, total, label=lb))
+            rows.append((target, actual, subdir, channels, started))
+            # 每测完一个温度就重写清单：中途停止时已测的温度仍可分析
+            with open(run_dir / TAS_MANIFEST, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                writer.writerow(('target_K', 'actual_K', 'folder', 'channels', 'started'))
+                writer.writerows(rows)
 
     def _run_bias_sequence(self, instrument, relay, config, biases,
                            calibration_store, run_dir):
@@ -1132,7 +1377,7 @@ class EISGui:
                 writer.writerow(('bias_V', 'folder', 'channels'))
                 writer.writerows(rows)
 
-    def _run_worker(self, config, biases, calibration_store=None):
+    def _run_worker(self, config, mode, sequence=None, calibration_store=None):
         log = logging.getLogger(__name__)
         instrument = None
         relay = None
@@ -1145,8 +1390,7 @@ class EISGui:
             relay = create_relay(config)
             output_dir = Path(config['output']['directory'])
             output_dir.mkdir(parents=True, exist_ok=True)
-            run_dir = new_run_dir(output_dir,
-                                  'bias_sequence_' if biases is not None else 'scan_')
+            run_dir = new_run_dir(output_dir, MODE_PREFIX[mode])
             log.info('Output: %s', run_dir)
             # 每次测量都留一份当时的完整配置，事后才能查清数据是按什么条件测的
             with open(run_dir / 'eis_config.yaml', 'w', encoding='utf-8') as f:
@@ -1181,16 +1425,24 @@ class EISGui:
             else:
                 log.warning('未使用开路/短路校准，保存的是原始阻抗。')
 
-            if biases is None:
+            if mode in ('single', 'cf'):
                 scan_config = copy.deepcopy(config)
                 scan_config['output']['directory'] = str(run_dir)
+                if mode == 'cf':
+                    v_dc = config['measurement']['capacitance']['v_dc']
+                    scan_config['measurement']['eis']['v_dc'] = v_dc
+                    self._wait_bias_settle(instrument, config, v_dc)
                 run_eis(instrument, relay, scan_config, str(run_dir),
                         calibration_store, on_point=self._point_observer)
-                details = f'扫描完成。\n结果：{run_dir}'
-            else:
-                self._run_bias_sequence(instrument, relay, config, biases,
+                details = f'{MODE_LABELS[mode]}完成。\n结果：{run_dir}'
+            elif mode == 'bias':
+                self._run_bias_sequence(instrument, relay, config, sequence,
                                         calibration_store, run_dir)
-                details = f'偏压序列扫描完成，共 {len(biases)} 个偏压。\n结果：{run_dir}'
+                details = f'偏压序列扫描完成，共 {len(sequence)} 个偏压。\n结果：{run_dir}'
+            else:
+                self._run_tas_sequence(instrument, relay, config, sequence,
+                                       calibration_store, run_dir)
+                details = f'热导纳谱完成，共 {len(sequence)} 个温度。\n结果：{run_dir}'
             outcome = 'ok'
         except CalibrationCancelled as exc:
             outcome, details = 'cal_cancelled', str(exc)
@@ -1218,7 +1470,44 @@ class EISGui:
                     instrument.close()
                 except Exception:
                     logging.getLogger(__name__).exception('关闭仪器失败')
-        self.events.put(('finished', outcome, details, str(run_dir) if run_dir else None))
+        # 仪器已释放后再分析：分析出错不影响测量本身的结局
+        if mode in ('cf', 'tas') and run_dir is not None and (
+                outcome == 'ok' or (mode == 'tas' and (run_dir / TAS_MANIFEST).exists())):
+            self._analysis_worker(mode, str(run_dir), config.get('sample') or {})
+        self.events.put(('finished', outcome, details, str(run_dir) if run_dir else None, mode))
+
+    def _analysis_worker(self, kind, run_dir, sample):
+        log = logging.getLogger(__name__)
+        try:
+            if kind == 'cf':
+                result = analyze_cf_run(run_dir, sample.get('area_cm2'),
+                                        sample.get('epsilon_r'), sample.get('thickness_nm'))
+            else:
+                result = analyze_tas(run_dir)
+                save_tas_results(result)
+            self.events.put(('analysis_done', kind, result))
+        except Exception as exc:
+            log.exception('分析失败')
+            self.events.put(('analysis_failed', kind, str(exc)))
+
+    def _analyze_latest_clicked(self, sender=None, app_data=None, user_data=None):
+        """分析输出目录里最近一次 cf_ / tas_ 测量。"""
+        try:
+            sample = self._settings().get('sample') or {}
+        except ValueError as exc:
+            self._show_message('设置无效', str(exc))
+            return
+        out = Path(self._resolved_output_dir())
+        runs = [d for d in out.glob('*') if d.is_dir() and d.name.startswith(('cf_', 'tas_'))] \
+            if out.exists() else []
+        if not runs:
+            self._show_message('没有数据', f'输出目录里没有 cf_ 或 tas_ 测量：\n{out}')
+            return
+        latest = max(runs, key=lambda d: d.stat().st_mtime)
+        kind = 'cf' if latest.name.startswith('cf_') else 'tas'
+        dpg.set_value('status', f'正在分析 {latest.name}…')
+        threading.Thread(target=self._analysis_worker, args=(kind, str(latest), sample),
+                         daemon=True).start()
 
     def _poll_events(self):
         while True:
@@ -1242,6 +1531,28 @@ class EISGui:
                 self.prompt_response = None
                 self.prompt_result = None
                 dpg.configure_item('calibration_dialog', show=False)
+            elif event[0] == 'temp_prompt':
+                _, target, index, total, self.temp_response, self.temp_result = event
+                dpg.set_value('temp_step', f'热导纳谱 第 {index} / {total} 个温度')
+                dpg.set_value('temp_prompt',
+                              f'请把样品温度调到 {target:g} K，等温度稳定后，填入实测温度并开始测量。'
+                              '\n（直流偏压已关闭。）')
+                dpg.set_value('temp_actual', f'{target:g}')
+                dpg.set_value('temp_error', '')
+                self._show_centered('temp_dialog')
+            elif event[0] == 'close_temp_prompt':
+                if self.temp_response is not None:
+                    self.temp_response.set()
+                self.temp_response = None
+                self.temp_result = None
+                dpg.configure_item('temp_dialog', show=False)
+            elif event[0] == 'stage':
+                dpg.set_value('status', event[1])
+            elif event[0] == 'analysis_done':
+                self._show_analysis(event[1], event[2])
+            elif event[0] == 'analysis_failed':
+                dpg.set_value('analysis_summary', f'分析失败：{event[2]}')
+                self._append_log(f'分析失败：{event[2]}')
             elif event[0] == 'bias_start':
                 _, bias, index, total = event
                 dpg.set_value('status', f'偏压 {index}/{total}：{bias:+g} V')
@@ -1282,10 +1593,10 @@ class EISGui:
             elif event[0] == 'fit_done':
                 self._show_fit_results(event[1])
             elif event[0] == 'finished':
-                _, outcome, details, run_dir = event
+                _, outcome, details, run_dir, mode = event
                 self._set_running(False)
                 status, title, color = {
-                    'ok': ('扫描完成', '完成', self.OK_GREEN),
+                    'ok': (f'{MODE_LABELS[mode]}完成', '完成', self.OK_GREEN),
                     'cancelled': ('扫描已停止', '扫描已停止', self.WARN_AMBER),
                     'cal_cancelled': ('校准已取消', '校准已取消', self.WARN_AMBER),
                 }.get(outcome, ('测量失败', '测量失败', self.ERR_RED))
@@ -1295,8 +1606,10 @@ class EISGui:
                               f'用时 {format_duration(time.monotonic() - self.run_started)}')
                 self._update_cal_info()
                 self._show_message(title, details)
-                if outcome == 'ok' and dpg.get_value('auto_fit'):
-                    threading.Thread(target=self._fit_worker, args=(run_dir,),
+                # 等效电路拟合只对 EIS 扫描有意义；C-f / TAS 走自己的分析
+                if outcome == 'ok' and mode in ('single', 'bias') and dpg.get_value('auto_fit'):
+                    threading.Thread(target=self._fit_worker,
+                                     args=(run_dir, self._fit_weighting()),
                                      daemon=True).start()
 
     def _delete_series(self, tag):
@@ -1318,32 +1631,41 @@ class EISGui:
         dpg.configure_item('progress', overlay='0 / 0 点')
         dpg.set_value('progress_time', '')
         for axis in ('nyquist_x', 'nyquist_y', 'magnitude_x', 'magnitude_y',
-                     'phase_x', 'phase_y'):
+                     'phase_x', 'phase_y', 'cf_x', 'cf_y'):
             dpg.set_axis_limits_auto(axis)
 
     def _record_point(self, bias, channel, frequency, z_real, z_imag, magnitude,
-                      phase_deg, index, total, done=None):
-        self._plot_point(bias, channel, frequency, z_real, z_imag, magnitude, phase_deg)
-        prefix = f'{bias:+g} V · ' if bias is not None else ''
+                      phase_deg, index, total, done=None, label=None):
+        self._plot_point(bias, channel, frequency, z_real, z_imag, magnitude, phase_deg, label)
+        prefix = f'{label} · ' if label else f'{bias:+g} V · ' if bias is not None else ''
         flag = '（无效点）' if not (math.isfinite(z_real) and math.isfinite(z_imag)) else ''
         dpg.set_value('status',
                       f'{prefix}CH {channel}: {index}/{total} 点，{frequency:.1f} Hz{flag}')
         self._update_progress(index, total, done)
 
-    def _plot_point(self, bias, channel, frequency, z_real, z_imag, magnitude, phase_deg):
+    def _plot_point(self, bias, channel, frequency, z_real, z_imag, magnitude, phase_deg,
+                    label=None):
         # 仪器状态 -1/1/2 的点是 NaN：不画进曲线（否则会打断折线、搅乱自动坐标），只计进度
         if not (math.isfinite(z_real) and math.isfinite(z_imag)):
             return
-        key = (bias, channel)
+        key = (label if label is not None else bias, channel)
         data = self.live_data.setdefault(key, {
             'freq': [], 'z_real': [], 'neg_z_imag': [], 'magnitude': [], 'phase': [],
+            'cap': [],
         })
         data['freq'].append(frequency)
         data['z_real'].append(z_real)
         data['neg_z_imag'].append(-z_imag)
         data['magnitude'].append(magnitude)
         data['phase'].append(phase_deg)
-        series_label = f'CH {channel}, {bias:+g} V' if bias is not None else f'CH {channel}'
+        # 并联模型电容 C_p = Im(1/Z)/ω，单位 nF
+        data['cap'].append((1.0 / complex(z_real, z_imag)).imag / (2 * math.pi * frequency) * 1e9)
+        if label is not None:
+            series_label = f'CH {channel}, {label}'
+        elif bias is not None:
+            series_label = f'CH {channel}, {bias:+g} V'
+        else:
+            series_label = f'CH {channel}'
         if key not in self.live_series:
             color = self.PALETTE[len(self.live_series) % len(self.PALETTE)]
             self.live_series[key] = {
@@ -1353,6 +1675,8 @@ class EISGui:
                                                  label=series_label, parent='magnitude_y'),
                 'phase': dpg.add_line_series(data['freq'], data['phase'],
                                              label=series_label, parent='phase_y'),
+                'cf': dpg.add_line_series(data['freq'], data['cap'],
+                                          label=series_label, parent='cf_y'),
             }
             for tag in self.live_series[key].values():
                 self._style_series(tag, color)
@@ -1361,6 +1685,7 @@ class EISGui:
             dpg.set_value(tags['nyquist'], [data['z_real'], data['neg_z_imag']])
             dpg.set_value(tags['magnitude'], [data['freq'], data['magnitude']])
             dpg.set_value(tags['phase'], [data['freq'], data['phase']])
+            dpg.set_value(tags['cf'], [data['freq'], data['cap']])
 
     def _update_progress(self, index, total, done):
         # 进度条按整次测量（全部偏压 × 通道）计算；以前只显示当前这一条曲线，
@@ -1384,7 +1709,7 @@ class EISGui:
         if now - self._last_axis_update >= 0.25 or index >= total:
             self._last_axis_update = now
             for axis in ('nyquist_x', 'nyquist_y', 'magnitude_x', 'magnitude_y',
-                         'phase_x', 'phase_y'):
+                         'phase_x', 'phase_y', 'cf_x', 'cf_y'):
                 dpg.set_axis_limits_auto(axis)
 
     # 曲线配色：白底上要压暗一档，否则黄／浅绿几乎看不见
@@ -1414,7 +1739,8 @@ class EISGui:
 
     def _fit_latest_clicked(self, sender=None, app_data=None, user_data=None):
         dpg.set_value('status', '正在拟合最新数据…')
-        threading.Thread(target=self._fit_worker, daemon=True).start()
+        threading.Thread(target=self._fit_worker, args=(None, self._fit_weighting()),
+                         daemon=True).start()
 
     def _resolved_output_dir(self):
         return self._resolved_output_dir_from(dpg.get_value('output_dir'))
@@ -1427,15 +1753,22 @@ class EISGui:
             path = CONFIG_PATH.parent / path
         return str(path.resolve())
 
-    def _fit_worker(self, target_dir=None):
-        """拟合 target_dir（刚完成的那次测量）；手动点按钮时取输出目录里最新的一次。"""
+    def _fit_weighting(self):
+        label = dpg.get_value('fit_weighting')
+        return next((k for k, v in FIT_WEIGHTINGS.items() if v == label), DEFAULT_WEIGHTING)
+
+    def _fit_worker(self, target_dir=None, weighting=DEFAULT_WEIGHTING):
+        """拟合 target_dir（刚完成的那次测量）；手动点按钮时取输出目录里最新的一次。
+
+        weighting 由主线程读好传进来：工作线程里不碰界面控件。
+        """
         try:
             csvs = find_latest_csv(target_dir or self._resolved_output_dir())
             results = []
             # 以前只取前 20 个文件：-1:1:0.1 这种 21 个偏压的序列会静默漏掉最后一个
             for path in csvs:
                 try:
-                    results.append(fit_csv(path))
+                    results.append(fit_csv(path, weighting=weighting))
                 except Exception as exc:
                     logging.getLogger(__name__).warning('拟合失败 %s: %s', path, exc)
             self.events.put(('fit_done', results))
@@ -1460,7 +1793,7 @@ class EISGui:
         for r in results:
             if r.get('shorted'):
                 self._add_fit_row([r['label'], '短路/失效',
-                                   f"{r['short_z']:.4g}", '—', '—', '—', '—',
+                                   f"{r['short_z']:.4g}", '—', '—', '—', '—', '—',
                                    f"相位 {r['short_ph']:.1f}°"])
                 continue
             fit = r['best_fit']
@@ -1470,9 +1803,15 @@ class EISGui:
             else:
                 cq, n = f"{fit['Q']:.4g}", f"{fit['n']:.3f}"
                 tau = '—'
-            self._add_fit_row([r['label'], fit['model'],
-                               f"{fit['Rs']:.4g}", f"{fit['Rp']:.4g}",
-                               cq, n, tau, f"{fit['norm_error']:.2%}"])
+            # Rs 贴在 min(Re Z) 上限时由约束决定，数值后面加 * 提醒
+            rs = f"{fit['Rs']:.4g}" + ('*' if fit.get('rs_at_bound') else '')
+            inductance = f"{fit['L']:.3g}" if 'L' in fit else '—'
+            # Rp 撞上限 = 弧未闭合，只能给下限
+            rp = f">{fit['z_max']:.3g}" if fit.get('rp_at_bound') else f"{fit['Rp']:.4g}"
+            if fit.get('rp_at_bound'):
+                tau = '—'
+            self._add_fit_row([r['label'], fit['model'], rs, rp,
+                               cq, n, inductance, tau, f"{fit['rel_error']:.2%}"])
 
     def _export_fit_report(self, sender=None, app_data=None, user_data=None):
         """把当前拟合结果导出为 CSV 报告到输出目录。"""
@@ -1486,34 +1825,47 @@ class EISGui:
             path = out_dir / f'拟合报告_{stamp}.csv'
             with open(path, 'w', newline='', encoding='utf-8-sig') as f:
                 writer = csv.writer(f)
-                writer.writerow(('数据集', '模型', 'Rs [ohm]', 'Rp [ohm]',
-                                 'C [F]', 'Q', 'n', 'tau [s]', 'Rs_upper_note',
-                                 '归一化误差', '数据点数', '频率范围下限 Hz',
-                                 '频率范围上限 Hz', '数据文件'))
+                writer.writerow(('数据集', '模型', 'Rs [ohm]', 'Rs 误差 [ohm]',
+                                 'Rs 贴上限 min(Re Z)', 'Rp [ohm]', 'Rp 误差 [ohm]',
+                                 'C [F]', 'Q', 'n', 'L [H]', 'tau [s]',
+                                 '相对误差', '归一化误差', 'AIC', 'BIC', '选择准则', '残差加权',
+                                 '候选模型', '数据点数', '频率范围下限 Hz', '频率范围上限 Hz',
+                                 '数据文件'))
+
+                def g(fit, key):
+                    return f"{fit[key]:.6g}" if key in fit else ''
+
                 for r in self.fit_results:
                     if r.get('shorted'):
-                        writer.writerow((r['label'], '短路/失效', f"{r['short_z']:.6g}",
-                                         '', '', '', '', '', '',
-                                         f"相位中位 {r['short_ph']:.2f}°",
-                                         r['n_points'], r['freq_range'][0],
+                        writer.writerow((r['label'], '短路/失效', f"{r['short_z']:.6g}", '', '',
+                                         '', '', '', '', '', '', '',
+                                         f"相位中位 {r['short_ph']:.2f}°", '', '', '', '', '',
+                                         '', r['n_points'], r['freq_range'][0],
                                          r['freq_range'][1], r['path']))
                         continue
                     fit = r['best_fit']
-                    writer.writerow((r['label'], fit['model'],
-                                     f"{fit['Rs']:.6g}", f"{fit['Rp']:.6g}",
-                                     f"{fit.get('C', ''):.6g}" if 'C' in fit else '',
-                                     f"{fit.get('Q', ''):.6g}" if 'Q' in fit else '',
-                                     f"{fit.get('n', ''):.6g}" if 'n' in fit else '',
-                                     f"{fit.get('tau', ''):.6g}" if 'tau' in fit else '',
-                                     'Rs <= min(Re Z)',
-                                     f"{fit['norm_error']:.6g}", r['n_points'],
-                                     r['freq_range'][0], r['freq_range'][1], r['path']))
+                    err = dict(zip([n.split(' ')[0] for n in fit['names']], fit['params_err']))
+                    writer.writerow((r['label'], fit['model'], g(fit, 'Rs'),
+                                     f"{err.get('Rs', float('nan')):.3g}",
+                                     '是' if fit.get('rs_at_bound') else '否',
+                                     (f">{fit['z_max']:.6g}（弧未闭合）" if fit.get('rp_at_bound')
+                                      else g(fit, 'Rp')),
+                                     f"{err.get('Rp', float('nan')):.3g}",
+                                     g(fit, 'C'), g(fit, 'Q'), g(fit, 'n'), g(fit, 'L'),
+                                     g(fit, 'tau'), f"{fit['rel_error']:.6g}",
+                                     f"{fit['norm_error']:.6g}", f"{fit['aic']:.2f}",
+                                     f"{fit['bic']:.2f}", r.get('criterion', '').upper(),
+                                     fit.get('weighting', ''), ' / '.join(r['all_fits']),
+                                     r['n_points'], r['freq_range'][0], r['freq_range'][1],
+                                     r['path']))
             dpg.set_value('fit_export_hint', f'已导出：{path.name}')
             self._show_message('导出成功', f'拟合报告已保存到：\n{path}')
         except Exception as exc:
             self._show_message('导出失败', str(exc))
 
     def _show_fit_results(self, results):
+        dpg.set_value('fit_header', True)
+        dpg.set_value('analysis_header', False)
         for tag in self.fit_series:
             self._delete_series(tag)
         self.fit_series = []
@@ -1535,14 +1887,27 @@ class EISGui:
                              f'（未拟合，疑似样品击穿或接触短路）')
                 continue
             fit = r['best_fit']
+            rp_text = f"Rp>{fit['z_max']:.3g} Ω" if fit.get('rp_at_bound') \
+                else f"Rp={fit['Rp']:.4g} Ω"
             if 'C' in fit:
-                param_text = (f"Rs={fit['Rs']:.4g} Ω, Rp={fit['Rp']:.4g} Ω, "
-                              f"C={fit['C']:.4g} F, τ={fit['tau']:.3g} s")
+                param_text = (f"Rs={fit['Rs']:.4g} Ω, {rp_text}, C={fit['C']:.4g} F"
+                              + ('' if fit.get('rp_at_bound') else f", τ={fit['tau']:.3g} s"))
             else:
-                param_text = (f"Rs={fit['Rs']:.4g} Ω, Rp={fit['Rp']:.4g} Ω, "
+                param_text = (f"Rs={fit['Rs']:.4g} Ω, {rp_text}, "
                               f"Q={fit['Q']:.3g}, n={fit['n']:.3f}")
+            if 'L' in fit:
+                param_text += f", L={fit['L']:.3g} H"
+            # 各候选模型的 ΔBIC：差值 < 2 说明数据分不出两者，> 10 是强证据
+            others = [f"{name} ΔBIC={other['bic'] - fit['bic']:+.1f}"
+                      for name, other in r['all_fits'].items() if name != r['best_name']]
             lines.append(f"[{r['label']}] {fit['model']}: {param_text}, "
-                         f"误差={fit['norm_error']:.2%}")
+                         f"相对误差={fit['rel_error']:.2%}"
+                         + (f"（{'；'.join(others)}）" if others else ''))
+            if fit.get('rs_at_bound'):
+                lines.append('    * Rs 贴在高频实部下限 min(Re Z) 上，由约束而非数据决定，报告时请注明')
+            if fit.get('rp_at_bound'):
+                lines.append(f"    * Rp 撞到拟合上限：弧在测量频段内没有闭合，只能说 Rp > "
+                             f"{fit['z_max']:.3g} Ω（实测最大 |Z|），不要报具体数值")
             for tag, scatter in (
                     (dpg.add_scatter_series(
                         r['z'].real.tolist(), (-r['z'].imag).tolist(),
@@ -1561,8 +1926,109 @@ class EISGui:
                 self._style_series(tag, color, scatter=scatter)
         for axis in ('fit_nyq_x', 'fit_nyq_y', 'fit_bode_x', 'fit_bode_y'):
             dpg.set_axis_limits_auto(axis)
+        if results and not results[0].get('shorted'):
+            first = results[0]
+            lines.insert(0, f"残差加权：{FIT_WEIGHTINGS.get(first.get('weighting'), '')}；"
+                            f"按 {first.get('criterion', 'bic').upper()} 选模型"
+                            + ('；高频有感性点，已加入带 L 的模型'
+                               if any(r.get('inductive') for r in results) else ''))
         dpg.set_value('fit_summary', '\n'.join(lines) if lines else '没有可拟合的数据。')
         dpg.set_value('status', f'拟合完成: {len(results)} 个数据集')
+
+    def _answer_temperature(self, sender, app_data, user_data):
+        if self.temp_result is None:
+            dpg.configure_item('temp_dialog', show=False)
+            return
+        if user_data:
+            try:
+                kelvin = parse_float(dpg.get_value('temp_actual'), '实测温度 K',
+                                     minimum=4, maximum=700)
+            except ValueError as exc:
+                # 填错时弹窗留着，直接在下面提示
+                dpg.set_value('temp_error', str(exc))
+                return
+            self.temp_result['kelvin'] = kelvin
+        dpg.set_value('temp_error', '')
+        self.temp_result['continue'] = bool(user_data)
+        if self.temp_response is not None:
+            self.temp_response.set()
+        self.temp_response = None
+        self.temp_result = None
+        dpg.configure_item('temp_dialog', show=False)
+
+    def _show_analysis(self, kind, result):
+        for tag in self.ana_series:
+            self._delete_series(tag)
+        self.ana_series = []
+
+        def add(series, color, scatter=False):
+            self.ana_series.append(series)
+            self._style_series(series, color, scatter=scatter)
+
+        lines = [f'目录：{result["run_dir"]}']
+        if kind == 'cf':
+            dpg.configure_item('ana_plot_left', label='C-f（虚线 = C_geo）')
+            dpg.configure_item('ana_left_y', label='C_p [nF]')
+            dpg.configure_item('ana_plot_right', label='（热导纳谱专用）')
+            for i, (label, r) in enumerate(result['results']):
+                color = self.PALETTE[i % len(self.PALETTE)]
+                add(dpg.add_line_series(r['freq'].tolist(), (r['C'] * 1e9).tolist(),
+                                        label=label, parent='ana_left_y'), color)
+                add(dpg.add_line_series([r['f_lo'], r['f_hi']], [r['C_geo'] * 1e9] * 2,
+                                        label=f'{label} C_geo', parent='ana_left_y'), color)
+                text = (f'[{label}] C_geo = {r["C_geo"]:.4g} F，平台 {r["f_lo"]:.4g}–'
+                        f'{r["f_hi"]:.4g} Hz（{r["n_points"]} 点）')
+                if r.get('C_geo_per_area') is not None:
+                    text += f'，{r["C_geo_per_area"]:.4g} F/cm²'
+                if r['thickness_from_eps_nm']:
+                    text += f'；εr = {r["eps_r"]:g} → 厚度 {r["thickness_from_eps_nm"]:.1f} nm'
+                if r['eps_from_thickness']:
+                    text += f'；厚度 {r["thickness_nm"]:g} nm → εr = {r["eps_from_thickness"]:.2f}'
+                if not r['found']:
+                    text += '\n  ⚠ 没找到平坦段，C_geo 取最平的一点，仅供参考（陷阱响应可能延伸到测量上限）'
+                lines.append(text)
+            if not result['results'][0][1].get('area_cm2'):
+                lines.append('未填电极面积：只给出 C_geo，不换算厚度 / 介电常数。')
+        else:
+            dpg.configure_item('ana_plot_left', label='-dC/dln f（各温度）')
+            dpg.configure_item('ana_left_y', label='-dC/dln f [nF]')
+            dpg.configure_item('ana_plot_right', label='Arrhenius')
+            first = True
+            for ch, data in sorted(result['channels'].items()):
+                a = data['arrhenius']
+                if first:
+                    # 左图只画第一个通道，多通道叠在一起读不清；其余看 tas_ch*.png
+                    for i, sp in enumerate(data['spectra']):
+                        add(dpg.add_line_series(sp['freq'].tolist(), (sp['deriv'] * 1e9).tolist(),
+                                                label=f'ch{ch} {sp["T"]:g} K',
+                                                parent='ana_left_y'),
+                            self.PALETTE[i % len(self.PALETTE)])
+                if a['n']:
+                    add(dpg.add_scatter_series((a['inv_T'] * 1000).tolist(), a['y'].tolist(),
+                                               label=f'ch{ch} 峰', parent='ana_right_y'),
+                        self.PALETTE[ch % len(self.PALETTE)], scatter=True)
+                if np.isfinite(a['Ea_eV']):
+                    x = np.linspace(a['inv_T'].min(), a['inv_T'].max(), 20)
+                    add(dpg.add_line_series((x * 1000).tolist(),
+                                            (a['intercept'] + a['slope'] * x).tolist(),
+                                            label=f'ch{ch} 拟合', parent='ana_right_y'),
+                        self.PALETTE[ch % len(self.PALETTE)])
+                    lines.append(f'[ch{ch}] Ea = {a["Ea_eV"]:.3f} ± {a["Ea_err_eV"]:.3f} eV，'
+                                 f'ξ0 = {a["xi0"]:.3g}，R² = {a["r2"]:.4f}（{a["n"]} 个温度）')
+                else:
+                    lines.append(f'[ch{ch}] 有效发射峰只有 {a["n"]} 个，至少要 3 个才能拟合激活能。')
+                if data['no_peak_T']:
+                    lines.append('  无内部发射峰（未参与拟合）：'
+                                 + ', '.join(f'{t:g} K' for t in data['no_peak_T']))
+                first = False
+            lines.append('图与数据：tas_ch*.png、tas_peaks.csv、tas_arrhenius.csv')
+        for axis in ('ana_left_x', 'ana_left_y', 'ana_right_x', 'ana_right_y'):
+            dpg.set_axis_limits_auto(axis)
+        dpg.set_value('analysis_summary', '\n'.join(lines))
+        # 分析区在拟合区下面，不折叠拟合区的话结果落在屏幕外
+        dpg.set_value('fit_header', False)
+        dpg.set_value('analysis_header', True)
+        self._append_log('分析完成：' + lines[-1] if len(lines) > 1 else '分析完成')
 
     def _answer_prompt(self, sender, app_data, user_data):
         if self.prompt_result is not None:

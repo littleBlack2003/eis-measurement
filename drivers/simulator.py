@@ -18,6 +18,11 @@ class EISSimulator:
         self.noise = float(sim.get('noise_level', 0.005))
         self._function = 'ztd'
         self._channel = 0
+        self.temperature = 300.0     # K, 仅用于陷阱模型; TAS 流程会按输入的实际温度更新
+
+    def set_sample_temperature(self, kelvin: float):
+        """仿真专用: 真实仪器不知道样品温度, 由操作员手动控温。"""
+        self.temperature = float(kelvin)
 
     def close(self):
         """仿真器无需资源释放."""
@@ -35,8 +40,17 @@ class EISSimulator:
 
         omega = 2.0 * np.pi * freq
         # 并联 RC 支路 (含结电容对偏压的一阶依赖)
-        z_rc = 1.0 / (1.0 / rsh + 1j * omega * c * (1.0 - 0.05 * vdc))
-        return rs + z_rc
+        y = 1.0 / rsh + 1j * omega * c * (1.0 - 0.05 * vdc)
+        trap = p.get('trap')
+        if trap:
+            # 陷阱支路 C_t 串 R_t, 时间常数 1/ω0, ω0 = 2 ξ0 T² exp(-Ea/kT):
+            # 低频 C = C + C_t, 高频冻结回 C, -dC/dlnω 在 ω0 处出峰
+            t = self.temperature
+            w0 = 2.0 * float(trap['xi0']) * t ** 2 * np.exp(
+                -float(trap['energy']) / (8.617333262e-5 * t))
+            ct = float(trap['capacitance'])
+            y += 1j * omega * ct / (1.0 + 1j * omega / w0)
+        return rs + 1.0 / y
 
     def measure_complex_z(self, freq: float, vac: float, vdc: float = 0.0,
                           averaging: int = 1, settle_time: float = 0.05) -> complex:

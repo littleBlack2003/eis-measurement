@@ -9,11 +9,22 @@ import re
 import numpy as np
 import pandas as pd
 
-from analysis.fitting import fit_equivalent_circuit
+from analysis.fitting import DEFAULT_WEIGHTING, MODELS, fit_equivalent_circuit
 
 # 短路/失效判定阈值: 中位 |Z| 极小且近似纯电阻
 SHORT_Z_LIMIT = 20.0      # ohm
 SHORT_PHASE_LIMIT = 20.0  # deg
+
+# 模型选择准则。只比误差会永远选参数多的模型 (CPE 在 n=1 时就是 RC, 带 L 的
+# 模型在 L→0 时就是不带 L 的模型): 2026-10 对 80 条实测谱的检验中, 按误差
+# 选有 47 条选了带 L 的模型, 而拟合出的 L 全都贴在 1e-12 H 下界 —— 纯粹是多
+# 一个参数占的便宜。BIC 对每个参数罚 ln(N), 比 AIC 更保守。
+CRITERIA = ('bic', 'aic')
+DEFAULT_CRITERION = 'bic'
+# 只有 >100 kHz 出现感性点 (Im Z > 0) 时才让带串联电感的模型参与比较:
+# 上述 80 条谱都没有感性点, BIC 仍有 7 条选了带 L 的模型 (都是假阳性),
+# 而且 Rs 随偏压的一致性反而变差。
+INDUCTIVE_FREQ = 1e5
 
 
 def _bias_from_folder(name: str) -> float:
@@ -74,8 +85,9 @@ def find_latest_csv(output_dir: str) -> list:
                   if re.match(r'eis_ch\d+\.csv$', f))
 
 
-def fit_csv(path: str) -> dict:
-    """对单条 EIS 频谱做短路检测与等效电路拟合."""
+def fit_csv(path: str, weighting: str = DEFAULT_WEIGHTING,
+            criterion: str = DEFAULT_CRITERION) -> dict:
+    """对单条 EIS 频谱做短路检测与等效电路拟合, 按信息准则选模型."""
     df = pd.read_csv(path)
     freq = df['freq [Hz]'].values.astype(float)
     z = df['Z_real [ohm]'].values + 1j * df['Z_imag [ohm]'].values
@@ -103,16 +115,24 @@ def fit_csv(path: str) -> dict:
         return res
     res['shorted'] = False
 
+    if criterion not in CRITERIA:
+        raise ValueError(f'未知准则: {criterion} (可选 {CRITERIA})')
+    inductive = bool(np.any((freq > INDUCTIVE_FREQ) & (z.imag > 0)))
+    candidates = ['RC', 'CPE'] + (['L-RC', 'L-CPE'] if inductive else [])
     fits = {}
-    for use_cpe, name in [(False, 'Rs(RpC)'), (True, 'Rs(RpCPE)')]:
+    for key in candidates:
         try:
-            fits[name] = fit_equivalent_circuit(freq, z, use_cpe=use_cpe, freq_min=0)
+            r = fit_equivalent_circuit(freq, z, model=key, freq_min=0, weighting=weighting)
+            fits[r['model']] = r
         except Exception:
             pass
     if not fits:
         raise RuntimeError(f'所有等效电路模型拟合失败: {path}')
-    best_name = min(fits, key=lambda k: fits[k]['norm_error'])
+    best_name = min(fits, key=lambda k: fits[k][criterion])
     res['best_name'] = best_name
     res['best_fit'] = fits[best_name]
     res['all_fits'] = fits
+    res['inductive'] = inductive
+    res['criterion'] = criterion
+    res['weighting'] = weighting
     return res
