@@ -13,7 +13,7 @@ try:
     print('[ok] UI 构建并渲染 3 帧')
 
     required = ['main_window', 'progress', 'fit_table', 'log_text', 'start_button',
-                'bias_start_button', 'stop_button', 'status', 'fit_summary',
+                'mode_tabs', 'stop_button', 'status', 'fit_summary',
                 'settle_time', 'output_dir', 'connect_button', 'list_resources_button',
                 'conn_status']
     missing = [t for t in required if not dpg.does_item_exist(t)]

@@ -166,7 +166,7 @@ FIT_WEIGHTINGS = {
 }
 
 # 测量模式 -> 显示名 / 输出子目录前缀
-MODE_LABELS = {'single': '完整扫描', 'bias': '偏压序列', 'cf': '活性层电容测量',
+MODE_LABELS = {'single': '阻抗谱扫描', 'bias': '偏压序列', 'cf': '活性层电容测量',
                'tas': '热导纳谱'}
 MODE_PREFIX = {'single': 'scan_', 'bias': 'bias_sequence_', 'cf': 'cf_', 'tas': 'tas_'}
 
@@ -244,6 +244,8 @@ class EISGui:
         self.temp_response = None         # 调温弹窗与工作线程之间的应答
         self.temp_result = None
         self.ana_series = []              # 分析图里的曲线，重新分析时先删掉
+        self.current_mode = 'single'      # 左栏当前选中的测量功能
+        self.running_mode = None          # 正在运行的功能（运行中不允许切走）
         self.run_started = 0.0
         try:
             with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
@@ -275,6 +277,7 @@ class EISGui:
     RIGHT_WIDTH = 900                     # 右栏总宽（与 1420 视口匹配，可被缩放回调改写）
     CONTENT_WIDTH = 874                   # 右栏内容统一宽度
     PANEL_HEIGHT = 850                    # 两栏高度（超出各自滚动）
+    LEFT_FOOTER = 310                     # 左栏底部固定区（开始/停止/进度/状态）的高度
 
     # 明亮主题配色：控件走 mvThemeCat_Core，图表走 mvThemeCat_Plots
     LIGHT_CORE = {
@@ -290,9 +293,11 @@ class EISGui:
         'ButtonActive': (178, 199, 223),
         'Header': (223, 231, 241), 'HeaderHovered': (203, 216, 232),
         'HeaderActive': (178, 199, 223),
+        # 选中的标签页要和面板底色区分开；ImGui 在标签栏所在窗口没有焦点时改用
+        # Unfocused(Dimmed) 两色——点一下右栏就会触发，所以这两色也要能分辨
         'Tab': (226, 233, 242), 'TabHovered': (204, 217, 234),
-        'TabActive': (255, 255, 255), 'TabUnfocused': (233, 238, 245),
-        'TabUnfocusedActive': (245, 249, 252),
+        'TabActive': (190, 214, 242), 'TabUnfocused': (233, 238, 245),
+        'TabUnfocusedActive': (204, 222, 244),
         'TitleBg': (233, 239, 246), 'TitleBgActive': (214, 227, 242),
         'TitleBgCollapsed': (234, 240, 247),
         'ScrollbarBg': (242, 245, 250), 'ScrollbarGrab': (188, 199, 213),
@@ -363,7 +368,34 @@ class EISGui:
                                         category=dpg.mvThemeCat_Core)
                     dpg.add_theme_color(dpg.mvThemeCol_FrameBg, self.INPUT_BG,
                                         category=dpg.mvThemeCat_Core)
+            # 进度条和输入框同样是白底无边框，看不出总长度；同一类控件只能有一个
+            # theme_component（后写的会盖掉前面的），所以边框和填充色写在一起
+            with dpg.theme_component(dpg.mvProgressBar):
+                dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 1,
+                                    category=dpg.mvThemeCat_Core)
+                dpg.add_theme_color(dpg.mvThemeCol_Border, self.INPUT_BORDER,
+                                    category=dpg.mvThemeCat_Core)
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBg, self.INPUT_BG,
+                                    category=dpg.mvThemeCat_Core)
+                # 填充色（ImGui 用 PlotHistogram 画进度条）
+                dpg.add_theme_color(dpg.mvThemeCol_PlotHistogram, (92, 150, 214, 255),
+                                    category=dpg.mvThemeCat_Core)
         dpg.bind_theme('app_theme')
+        # 测量功能标签页：选中项用浅蓝底，和未选中的灰底拉开，一眼看出当前是哪个功能
+        with dpg.theme(tag='mode_tabs_theme'):
+            with dpg.theme_component(dpg.mvAll):
+                # 有焦点和无焦点（Dimmed）用同一套颜色：选中项始终是蓝底 + 蓝色顶线
+                for col, rgb in (
+                        (dpg.mvThemeCol_Tab, (232, 237, 244)),
+                        (dpg.mvThemeCol_TabDimmed, (232, 237, 244)),
+                        (dpg.mvThemeCol_TabHovered, (208, 224, 244)),
+                        (dpg.mvThemeCol_TabSelected, (160, 196, 236)),
+                        (dpg.mvThemeCol_TabDimmedSelected, (160, 196, 236)),
+                        (dpg.mvThemeCol_TabSelectedOverline, self.ACCENT[:3]),
+                        (dpg.mvThemeCol_TabDimmedSelectedOverline, self.ACCENT[:3])):
+                    dpg.add_theme_color(col, (*rgb, 255), category=dpg.mvThemeCat_Core)
+                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 12, 6,
+                                    category=dpg.mvThemeCat_Core)
 
     def _button_themes(self):
         """给三个主按钮上色，避免四个按钮一模一样而误点"停止扫描"。
@@ -371,16 +403,15 @@ class EISGui:
         明亮主题下正文是深色，所以实底按钮必须同时把按钮文字刷成白色，
         否则深底 + 深字根本看不见。
         """
+        # 开始按钮按功能换色（每个功能一套主题，切换标签页时重新绑定）
         schemes = (
-            ('start_button', (45, 125, 78), (56, 150, 94), (68, 172, 108)),
-            ('bias_start_button', (38, 108, 152), (48, 132, 182), (60, 152, 206)),
-            ('cf_start_button', (112, 84, 160), (132, 102, 184), (150, 120, 204)),
-            ('tas_start_button', (176, 104, 32), (200, 122, 44), (220, 140, 58)),
+            ('start_single', (45, 125, 78), (56, 150, 94), (68, 172, 108)),
+            ('start_bias', (38, 108, 152), (48, 132, 182), (60, 152, 206)),
+            ('start_cf', (112, 84, 160), (132, 102, 184), (150, 120, 204)),
+            ('start_tas', (176, 104, 32), (200, 122, 44), (220, 140, 58)),
             ('stop_button', (176, 62, 62), (204, 74, 74), (228, 90, 90)),
         )
         for tag, base, hover, active in schemes:
-            if not dpg.does_item_exist(tag):
-                continue
             with dpg.theme(tag=f'{tag}_theme'):
                 with dpg.theme_component(dpg.mvButton):
                     dpg.add_theme_color(dpg.mvThemeCol_Button, (*base, 255),
@@ -391,7 +422,8 @@ class EISGui:
                                         category=dpg.mvThemeCat_Core)
                     dpg.add_theme_color(dpg.mvThemeCol_Text, (255, 255, 255, 255),
                                         category=dpg.mvThemeCat_Core)
-            dpg.bind_item_theme(tag, f'{tag}_theme')
+        dpg.bind_item_theme('stop_button', 'stop_button_theme')
+        dpg.bind_item_theme('mode_tabs', 'mode_tabs_theme')
 
     def _hint(self, text, width=None):
         """淡色说明文字，给参数区补充格式或环境要求。"""
@@ -467,7 +499,94 @@ class EISGui:
             with dpg.group(horizontal=True):
                 # ================= 左栏：连接选项 + 测量参数（默认折叠） =================
                 with dpg.child_window(tag='left_panel', width=self.LEFT_WIDTH,
-                                      height=self.PANEL_HEIGHT, border=True):
+                                      height=self.PANEL_HEIGHT, border=True,
+                                      no_scrollbar=True):
+                  # 上半部分（参数）单独滚动，下半部分（开始/停止/进度）固定在底部：
+                  # 参数多的面板（热导纳谱）不会把开始按钮挤出视野
+                  with dpg.child_window(tag='left_scroll', border=False,
+                                        height=self.PANEL_HEIGHT - self.LEFT_FOOTER):
+                    # ---- 测量功能：每种功能一个面板，叠放在同一位置，用标签页切换 ----
+                    dpg.add_text('测量功能', color=self.ACCENT)
+                    with dpg.tab_bar(tag='mode_tabs', callback=self._on_mode_tab):
+                        with dpg.tab(label='阻抗谱扫描', tag='tab_single'):
+                            self._hint('在一个直流偏压下按下方扫频参数测阻抗谱，'
+                                       '测完自动做等效电路拟合。', width=self.LEFT_CONTENT)
+                            dpg.add_input_text(label='直流偏压 V', default_value=str(
+                                eis.get('v_dc', 0.0)), tag='v_dc', width=100)
+                        with dpg.tab(label='偏压序列', tag='tab_bias'):
+                            self._hint('依次在多个直流偏压下各扫一条阻抗谱。',
+                                       width=self.LEFT_CONTENT)
+                            dpg.add_input_text(label='偏压序列 V', default_value=str(
+                                measurement.get('bias_sequence', '0:1:0.1')),
+                                tag='bias_sequence', width=300,
+                                callback=self._on_param_change)
+                            self._hint('格式：起点:终点:步长（例如 1:-1:0.2）；或逗号列表'
+                                       '（0,0.2,0.5）。', width=self.LEFT_CONTENT)
+                        with dpg.tab(label='活性层电容', tag='tab_cf'):
+                            self._hint('固定偏压下扫 C-f，取高频平台为几何电容 C_geo。'
+                                       '填 εr 换算厚度 d = ε0·εr·A / C_geo；填厚度则反算 εr；'
+                                       '两项都可留空。偏压通常取 0 V 或反偏。',
+                                       width=self.LEFT_CONTENT)
+                            with dpg.group(horizontal=True):
+                                dpg.add_input_text(label='电极面积 cm²', default_value=opt(
+                                    sample.get('area_cm2', 0.1)), tag='sample_area', width=90)
+                                dpg.add_input_text(label='C-f 偏压 V', default_value=str(
+                                    capacitance.get('v_dc', 0.0)), tag='cf_v_dc', width=80)
+                            with dpg.group(horizontal=True):
+                                dpg.add_input_text(label='相对介电常数 εr', default_value=opt(
+                                    sample.get('epsilon_r')), tag='eps_r', width=80)
+                                dpg.add_input_text(label='厚度 nm', default_value=opt(
+                                    sample.get('thickness_nm')), tag='thickness_nm', width=80)
+                        with dpg.tab(label='热导纳谱', tag='tab_tas'):
+                            self._hint('手动控温。每个温度点：程序先关掉直流偏压，弹窗请你把温度'
+                                       '调到目标值、等稳定后填入实测温度，再扫一条 C-f。全部完成后'
+                                       '取 -dC/dln f 的峰为发射频率，按 ln(ω0/T²)–1/T 拟合激活能。'
+                                       '开路/短路校准只在开始时做一次。', width=self.LEFT_CONTENT)
+                            dpg.add_input_text(label='温度序列 K', default_value=str(
+                                tas.get('temperatures', '300:200:20')), tag='tas_temps',
+                                width=220, callback=self._on_param_change)
+                            dpg.add_input_text(label='TAS 偏压 V', default_value=str(
+                                tas.get('v_dc', 0.0)), tag='tas_v_dc', width=80)
+                    dpg.add_separator()
+                    # ---- 以下为各功能共用的设置 ----
+                    # 扫频参数默认展开：折叠起来就看不到本次到底按什么条件测
+                    with dpg.collapsing_header(label='扫频参数（各功能共用）', default_open=True):
+                        with dpg.group(horizontal=True):
+                            dpg.add_input_text(label='起始频率 Hz', default_value=str(
+                                eis.get('freq_start', 20)), tag='freq_start', width=110,
+                                callback=self._on_param_change)
+                            dpg.add_input_text(label='终止频率 Hz', default_value=str(
+                                eis.get('freq_stop', 1.0e6)), tag='freq_stop', width=110,
+                                callback=self._on_param_change)
+                        with dpg.group(horizontal=True):
+                            dpg.add_input_text(label='交流幅值 Vrms', default_value=str(
+                                eis.get('v_ac', 0.03)), tag='v_ac', width=100)
+                            dpg.add_input_text(label='平均次数', default_value=str(
+                                eis.get('averaging', 3)), tag='averaging', width=90)
+                        with dpg.group(horizontal=True):
+                            dpg.add_input_text(label='每十倍频点数', default_value=str(
+                                eis.get('points_per_decade', 20)), tag='points', width=90,
+                                callback=self._on_param_change)
+                            dpg.add_input_text(label='频点稳定时间 s', default_value=str(
+                                eis.get('settle_time', 0.08)), tag='settle_time', width=90)
+                        dpg.add_input_text(label='偏压稳定时间 s', default_value=str(
+                            measurement.get('bias_settle_s', 0.5)), tag='bias_settle',
+                            width=90)
+                        self._hint('HP 4284A 频率范围 20 Hz – 1 MHz，交流幅值 5 mV – 2 Vrms；'
+                                   '小信号测量一般取 10–50 mVrms。加上或切换直流偏压后，'
+                                   '先等“偏压稳定时间”再扫频。', width=self.LEFT_CONTENT)
+                    with dpg.collapsing_header(label='开路/短路校准', default_open=True):
+                        dpg.add_combo(list(CAL_MODES.values()), label='校准方式',
+                                      default_value=CAL_MODES[cal_mode_from_config(calibration)],
+                                      tag='cal_mode', width=230,
+                                      callback=self._on_param_change)
+                        dpg.add_checkbox(label='新建校准后确认再测量', default_value=bool(
+                            calibration.get('confirm_after', False)), tag='cal_confirm')
+                        dpg.add_text('', tag='cal_info', wrap=self.LEFT_CONTENT)
+                        self._hint('校准时直流偏压固定为 0 V。新建的校准会存到输出目录的 '
+                                   'calibration.json，供“使用上次保存的校准”复用；'
+                                   '频率轴或通道与当前设置不符时会拒绝开始。',
+                                   width=self.LEFT_CONTENT)
                     with dpg.collapsing_header(label='连接选项（仪器与通道）',
                                                default_open=False):
                         with dpg.group(horizontal=True):
@@ -496,115 +615,35 @@ class EISGui:
                         self._hint('通道可填多个，用逗号分隔（例如 0,1,2）。GPIB 需要本机安装 '
                                    'NI-VISA 或 Keysight IO Libraries；串口／TCP 才可用内置的 '
                                    'pyvisa-py 后端。', width=self.LEFT_CONTENT)
-                    # 测量参数默认展开：折叠起来就看不到本次到底按什么条件测
-                    with dpg.collapsing_header(label='测量参数', default_open=True):
-                        with dpg.group(horizontal=True):
-                            dpg.add_input_text(label='起始频率 Hz', default_value=str(
-                                eis.get('freq_start', 20)), tag='freq_start', width=110,
-                                callback=self._on_param_change)
-                            dpg.add_input_text(label='终止频率 Hz', default_value=str(
-                                eis.get('freq_stop', 1.0e6)), tag='freq_stop', width=110,
-                                callback=self._on_param_change)
-                        with dpg.group(horizontal=True):
-                            dpg.add_input_text(label='直流偏压 V', default_value=str(
-                                eis.get('v_dc', 0.0)), tag='v_dc', width=100)
-                            dpg.add_input_text(label='交流幅值 Vrms', default_value=str(
-                                eis.get('v_ac', 0.03)), tag='v_ac', width=100)
-                        with dpg.group(horizontal=True):
-                            dpg.add_input_text(label='每十倍频点数', default_value=str(
-                                eis.get('points_per_decade', 20)), tag='points', width=90,
-                                callback=self._on_param_change)
-                            dpg.add_input_text(label='平均次数', default_value=str(
-                                eis.get('averaging', 3)), tag='averaging', width=90)
-                        dpg.add_input_text(label='频点稳定时间 s', default_value=str(
-                            eis.get('settle_time', 0.08)), tag='settle_time', width=90)
-                        self._hint('HP 4284A 频率范围 20 Hz – 1 MHz，交流幅值 5 mV – 2 Vrms；'
-                                   '小信号测量一般取 10–50 mVrms。', width=self.LEFT_CONTENT)
-                    with dpg.collapsing_header(label='开路/短路校准', default_open=True):
-                        dpg.add_combo(list(CAL_MODES.values()), label='校准方式',
-                                      default_value=CAL_MODES[cal_mode_from_config(calibration)],
-                                      tag='cal_mode', width=230,
-                                      callback=self._on_param_change)
-                        dpg.add_checkbox(label='新建校准后确认再测量', default_value=bool(
-                            calibration.get('confirm_after', False)), tag='cal_confirm')
-                        dpg.add_text('', tag='cal_info', wrap=self.LEFT_CONTENT)
-                        self._hint('校准时直流偏压固定为 0 V。新建的校准会存到输出目录的 '
-                                   'calibration.json，供“使用上次保存的校准”复用；'
-                                   '频率轴或通道与当前设置不符时会拒绝开始。',
-                                   width=self.LEFT_CONTENT)
-                    with dpg.collapsing_header(label='偏压序列扫描', default_open=False):
-                        dpg.add_input_text(label='偏压序列 V', default_value=str(
-                            measurement.get('bias_sequence', '0:1:0.1')),
-                            tag='bias_sequence', width=300,
+                    with dpg.collapsing_header(label='输出目录', default_open=False):
+                        dpg.add_input_text(label='输出目录', default_value=str(
+                            output.get('directory', './data')), tag='output_dir', width=330,
                             callback=self._on_param_change)
-                        dpg.add_input_text(label='每个偏压稳定时间 s', default_value=str(
-                            measurement.get('bias_settle_s', 0.5)), tag='bias_settle',
-                            width=110)
-                        self._hint('格式：起点:终点:步长（例如 1:-1:0.2）；或逗号列表（0,0.2,0.5）。'
-                                   '切换偏压后先等待上述时间，再开始该偏压的整段扫描。',
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(label='浏览…', tag='browse_button',
+                                           callback=lambda: dpg.show_item('dir_dialog'),
+                                           width=90, height=30)
+                            dpg.add_button(label='使用默认目录', tag='default_dir_button',
+                                           callback=self._default_output, width=130, height=30)
+                            dpg.add_button(label='打开目录', callback=self._open_output_dir,
+                                           width=120, height=30)
+                        self._hint('每次测量都会在输出目录下新建带时间戳的子目录（scan_ / '
+                                   'bias_sequence_ / cf_ / tas_），不会覆盖以前的数据。',
                                    width=self.LEFT_CONTENT)
-                    with dpg.collapsing_header(label='活性层电容（C-f）', default_open=False):
-                        with dpg.group(horizontal=True):
-                            dpg.add_input_text(label='电极面积 cm²', default_value=opt(
-                                sample.get('area_cm2', 0.1)), tag='sample_area', width=90)
-                            dpg.add_input_text(label='C-f 偏压 V', default_value=str(
-                                capacitance.get('v_dc', 0.0)), tag='cf_v_dc', width=80)
-                        with dpg.group(horizontal=True):
-                            dpg.add_input_text(label='相对介电常数 εr', default_value=opt(
-                                sample.get('epsilon_r')), tag='eps_r', width=80)
-                            dpg.add_input_text(label='厚度 nm', default_value=opt(
-                                sample.get('thickness_nm')), tag='thickness_nm', width=80)
-                        self._hint('按“测量参数”的频率范围在固定偏压下扫 C-f，取高频平台为几何电容 '
-                                   'C_geo。填 εr 换算厚度 d = ε0·εr·A / C_geo；填厚度则反算 εr；'
-                                   '两项都可留空。偏压通常取 0 V 或反偏。', width=self.LEFT_CONTENT)
-                    with dpg.collapsing_header(label='热导纳谱（TAS，手动控温）', default_open=False):
-                        dpg.add_input_text(label='温度序列 K', default_value=str(
-                            tas.get('temperatures', '300:200:20')), tag='tas_temps', width=220,
-                            callback=self._on_param_change)
-                        dpg.add_input_text(label='TAS 偏压 V', default_value=str(
-                            tas.get('v_dc', 0.0)), tag='tas_v_dc', width=80)
-                        self._hint('每个温度点：程序先关掉直流偏压，弹窗请你把温度调到目标值、'
-                                   '等稳定后填入实测温度，再扫一条 C-f。全部温度完成后取 '
-                                   '-dC/dln f 的峰为发射频率，按 ln(ω0/T²)–1/T 拟合激活能。'
-                                   '开路/短路校准只在开始时做一次。', width=self.LEFT_CONTENT)
-                    dpg.add_separator()
-                    dpg.add_input_text(label='输出目录', default_value=str(
-                        output.get('directory', './data')), tag='output_dir', width=330,
-                        callback=self._on_param_change)
-                    with dpg.group(horizontal=True):
-                        dpg.add_button(label='浏览…', tag='browse_button',
-                                       callback=lambda: dpg.show_item('dir_dialog'),
-                                       width=90, height=30)
-                        dpg.add_button(label='使用默认目录', tag='default_dir_button',
-                                       callback=self._default_output, width=130, height=30)
-                        dpg.add_button(label='打开目录', callback=self._open_output_dir,
-                                       width=120, height=30)
-                    self._hint('每次测量都会在输出目录下新建带时间戳的子目录（scan_ / '
-                               'bias_sequence_ / cf_ / tas_），不会覆盖以前的数据。',
-                               width=self.LEFT_CONTENT)
-                    dpg.add_separator()
+                  dpg.add_separator()
+                  with dpg.group(tag='left_footer'):
+                    # ---- 开始 / 停止：只有一个开始按钮，文字和颜色跟随当前功能 ----
                     dpg.add_text('', tag='run_summary', wrap=self.LEFT_CONTENT)
+                    dpg.add_button(label='开始', tag='start_button',
+                                   callback=self._start_current_mode,
+                                   width=self.LEFT_CONTENT - 8, height=40)
                     with dpg.group(horizontal=True):
-                        dpg.add_button(label='开始完整扫描', tag='start_button',
-                                       callback=self._start, user_data='single',
-                                       width=200, height=38)
-                        dpg.add_button(label='扫描偏压序列', tag='bias_start_button',
-                                       callback=self._start, user_data='bias',
-                                       width=200, height=38)
-                    with dpg.group(horizontal=True):
-                        dpg.add_button(label='测量活性层电容', tag='cf_start_button',
-                                       callback=self._start, user_data='cf',
-                                       width=200, height=38)
-                        dpg.add_button(label='开始热导纳谱', tag='tas_start_button',
-                                       callback=self._start, user_data='tas',
-                                       width=200, height=38)
-                    with dpg.group(horizontal=True):
-                        dpg.add_button(label='停止扫描', tag='stop_button',
+                        dpg.add_button(label='停止', tag='stop_button',
                                        callback=self._cancel_scan, enabled=False,
-                                       width=140, height=38)
+                                       width=140, height=34)
                         dpg.add_button(label='保存配置', tag='save_config_button',
-                                       callback=self._save_config, width=140, height=38)
-                    # 连接测试放在始终可见的位置：参数区默认是折叠的，藏进去会找不到
+                                       callback=self._save_config, width=140, height=34)
+                    # 连接测试放在始终可见的位置：连接选项默认是折叠的，藏进去会找不到
                     with dpg.group(horizontal=True):
                         dpg.add_button(label='测试连接', tag='connect_button',
                                        callback=self._test_connection,
@@ -626,8 +665,8 @@ class EISGui:
                                       height=self.PANEL_HEIGHT, border=True):
                     dpg.add_text('数据窗口', color=self.ACCENT)
                     dpg.add_text('实时曲线（已测频点）', color=self.HINT)
-                    with dpg.tab_bar():
-                        with dpg.tab(label='Nyquist'):
+                    with dpg.tab_bar(tag='live_tabs'):
+                        with dpg.tab(label='Nyquist', tag='live_tab_nyquist'):
                             with dpg.plot(label='Nyquist', tag='plot_nyquist',
                                           width=self.CONTENT_WIDTH, height=300):
                                 dpg.add_plot_legend()
@@ -655,7 +694,7 @@ class EISGui:
                                                   auto_fit=True)
                                 dpg.add_plot_axis(dpg.mvYAxis, label='Phase [degree]',
                                                   tag='phase_y', auto_fit=True)
-                        with dpg.tab(label='C-f'):
+                        with dpg.tab(label='C-f', tag='live_tab_cf'):
                             with dpg.plot(label='Capacitance (parallel model)', tag='plot_cf',
                                           width=self.CONTENT_WIDTH, height=300):
                                 dpg.add_plot_legend()
@@ -720,7 +759,8 @@ class EISGui:
                                            default_value='暂无拟合结果。点击“拟合最新数据”，'
                                                          '或勾选“扫描完成后自动拟合”。')
                     with dpg.collapsing_header(label='活性层电容 / 热导纳谱分析',
-                                               tag='analysis_header', default_open=False):
+                                               tag='analysis_header', default_open=True,
+                                               show=False):
                         with dpg.group(horizontal=True):
                             dpg.add_button(label='分析最新 C-f / TAS 数据',
                                            tag='analyze_latest_button',
@@ -812,6 +852,8 @@ class EISGui:
         self._set_window_icon()
         # 启动后先按实际视口（含 DPI 缩放后的真实尺寸）校正一次
         self._apply_responsive_layout()
+        saved_mode = measurement.get('last_mode', 'single')
+        self._select_mode(saved_mode if saved_mode in MODE_LABELS else 'single')
         self._on_param_change()
 
     # 扫描期间锁定的控件：改了也不会作用到正在进行的测量，留着可编辑只会误导
@@ -824,7 +866,8 @@ class EISGui:
         'fit_latest_button', 'analyze_latest_button', 'fit_weighting',
         'sample_area', 'cf_v_dc', 'eps_r', 'thickness_nm', 'tas_temps', 'tas_v_dc',
     )
-    START_BUTTONS = ('start_button', 'bias_start_button', 'cf_start_button', 'tas_start_button')
+    START_BUTTONS = ('start_button',)
+    MODE_TABS = {'single': 'tab_single', 'bias': 'tab_bias', 'cf': 'tab_cf', 'tas': 'tab_tas'}
 
     def _set_running(self, running):
         for tag in self.START_BUTTONS:
@@ -834,6 +877,30 @@ class EISGui:
             if dpg.does_item_exist(tag):
                 dpg.configure_item(tag, enabled=not running)
         dpg.configure_viewport(0, disable_close=running)
+
+    def _on_mode_tab(self, sender, app_data, user_data=None):
+        tag = dpg.get_item_alias(app_data) if isinstance(app_data, int) else app_data
+        mode = next((m for m, t in self.MODE_TABS.items() if t == tag), 'single')
+        if self.running_mode and mode != self.running_mode:
+            # 测量进行中：标签页留在正在运行的功能上，免得看着别的面板以为参数会生效
+            dpg.set_value('mode_tabs', self.MODE_TABS[self.running_mode])
+            return
+        self._select_mode(mode)
+
+    def _select_mode(self, mode):
+        """切换测量功能：左栏面板、开始按钮、右栏结果区一起跟着变。"""
+        self.current_mode = mode
+        dpg.set_value('mode_tabs', self.MODE_TABS[mode])
+        dpg.configure_item('start_button', label=f'开始：{MODE_LABELS[mode]}')
+        dpg.bind_item_theme('start_button', f'start_{mode}_theme')
+        eis_like = mode in ('single', 'bias')
+        dpg.configure_item('fit_header', show=eis_like)
+        dpg.configure_item('analysis_header', show=not eis_like)
+        dpg.set_value('live_tabs', 'live_tab_nyquist' if eis_like else 'live_tab_cf')
+        self._update_run_summary()
+
+    def _start_current_mode(self, sender=None, app_data=None, user_data=None):
+        self._start(user_data=self.current_mode)
 
     def _on_param_change(self, sender=None, app_data=None, user_data=None):
         self._update_run_summary()
@@ -855,17 +922,22 @@ class EISGui:
             dpg.set_value('run_summary', f'参数待修正：{exc}')
             dpg.configure_item('run_summary', color=self.WARN_AMBER)
             return
-        text = f'单次扫描：{n_freq} 频点 × {n_ch} 通道 = {n_freq * n_ch} 点'
+        per_scan = f'{n_freq} 频点 × {n_ch} 通道 = {n_freq * n_ch} 点'
+        mode = self.current_mode
         try:
-            n_bias = len(parse_bias_sequence(dpg.get_value('bias_sequence')))
-            text += f'\n偏压序列：{n_bias} 个偏压，共 {n_freq * n_ch * n_bias} 点'
+            if mode == 'bias':
+                n_bias = len(parse_bias_sequence(dpg.get_value('bias_sequence')))
+                text = f'本次：{n_bias} 个偏压，每个 {per_scan}，共 {n_freq * n_ch * n_bias} 点'
+            elif mode == 'tas':
+                n_temp = len(parse_temperature_sequence(dpg.get_value('tas_temps')))
+                text = (f'本次：{n_temp} 个温度，每个 {per_scan}，共 {n_freq * n_ch * n_temp} 点'
+                        '（另加调温时间）')
+            else:
+                text = f'本次：{per_scan}'
         except ValueError as exc:
-            text += f'\n偏压序列无效：{exc}'
-        try:
-            n_temp = len(parse_temperature_sequence(dpg.get_value('tas_temps')))
-            text += f'\n热导纳谱：{n_temp} 个温度，共 {n_freq * n_ch * n_temp} 点（另加调温时间）'
-        except ValueError as exc:
-            text += f'\n温度序列无效：{exc}'
+            dpg.set_value('run_summary', f'参数待修正：{exc}')
+            dpg.configure_item('run_summary', color=self.WARN_AMBER)
+            return
         dpg.set_value('run_summary', text)
         dpg.configure_item('run_summary', color=self.ACCENT)
 
@@ -922,6 +994,7 @@ class EISGui:
         right_w = max(420, vw - 40 - self.LEFT_WIDTH - 10)
         content = max(400, right_w - 26)
         dpg.configure_item('left_panel', height=height)
+        dpg.configure_item('left_scroll', height=max(160, height - self.LEFT_FOOTER))
         dpg.configure_item('right_panel', width=right_w, height=height)
         for item in ('plot_nyquist', 'plot_magnitude', 'plot_phase', 'plot_cf'):
             dpg.configure_item(item, width=content)
@@ -1150,6 +1223,7 @@ class EISGui:
         config.setdefault('measurement', {})
         config['measurement']['channels'] = channels
         config['measurement']['bias_sequence'] = dpg.get_value('bias_sequence').strip()
+        config['measurement']['last_mode'] = self.current_mode
         config['measurement']['bias_settle_s'] = parse_float(
             dpg.get_value('bias_settle'), '偏压稳定时间', minimum=0, maximum=3600)
         config['measurement'].setdefault('eis', {})
@@ -1246,6 +1320,9 @@ class EISGui:
             (len(sequence) if sequence is not None else 1)
         self._points_done = 0
         self.cancel_event.clear()
+        # 从代码直接调用 _start(mode) 时也让左栏切到该功能
+        self._select_mode(mode)
+        self.running_mode = mode
         self._set_running(True)
         dpg.set_value('status', f'{MODE_LABELS[mode]}运行中…')
         dpg.configure_item('status', color=self.ACCENT)
@@ -1594,6 +1671,7 @@ class EISGui:
                 self._show_fit_results(event[1])
             elif event[0] == 'finished':
                 _, outcome, details, run_dir, mode = event
+                self.running_mode = None
                 self._set_running(False)
                 status, title, color = {
                     'ok': (f'{MODE_LABELS[mode]}完成', '完成', self.OK_GREEN),
@@ -1864,8 +1942,9 @@ class EISGui:
             self._show_message('导出失败', str(exc))
 
     def _show_fit_results(self, results):
+        if self.current_mode not in ('single', 'bias') and not self.running_mode:
+            self._select_mode('single')
         dpg.set_value('fit_header', True)
-        dpg.set_value('analysis_header', False)
         for tag in self.fit_series:
             self._delete_series(tag)
         self.fit_series = []
@@ -2025,8 +2104,9 @@ class EISGui:
         for axis in ('ana_left_x', 'ana_left_y', 'ana_right_x', 'ana_right_y'):
             dpg.set_axis_limits_auto(axis)
         dpg.set_value('analysis_summary', '\n'.join(lines))
-        # 分析区在拟合区下面，不折叠拟合区的话结果落在屏幕外
-        dpg.set_value('fit_header', False)
+        # 结果对应的功能面板如果没选中，就切过去，免得结果落在看不见的区域
+        if self.current_mode != kind and not self.running_mode:
+            self._select_mode(kind)
         dpg.set_value('analysis_header', True)
         self._append_log('分析完成：' + lines[-1] if len(lines) > 1 else '分析完成')
 
